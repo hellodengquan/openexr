@@ -18,6 +18,8 @@ add_executable(OpenEXRCoreTest
   initializer_compat.cpp
   initializer_compat.h
   main.cpp
+  pizIntegration.cpp
+  pizIntegration.h
   read.cpp
   read.h
   test_value.h
@@ -140,6 +142,8 @@ define_openexrcore_tests(
  testDWAACompression
  testDWABCompression
  testZstdCompression
+ testPIZBitPatterns
+ testPIZPartialChunks
  testHTChannelMap
  testHTHeaderBounds
  testDeepNoCompression

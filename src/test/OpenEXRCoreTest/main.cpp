@@ -26,6 +26,7 @@
 #include "deep.h"
 #include "general_attr.h"
 #include "initializer_compat.h"
+#include "pizIntegration.h"
 #include "read.h"
 #include "write.h"
 #include "buffer.h"
@@ -227,6 +228,8 @@ main (int argc, char* argv[])
     TEST (testDWAACompression, "core_compression");
     TEST (testDWABCompression, "core_compression");
     TEST (testZstdCompression, "core_compression");
+    TEST (testPIZBitPatterns, "core_compression");
+    TEST (testPIZPartialChunks, "core_compression");
     TEST (testHTChannelMap, "core_compression");
     TEST (testHTHeaderBounds, "core_compression");
 
