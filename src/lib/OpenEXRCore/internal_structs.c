@@ -418,6 +418,9 @@ internal_exr_alloc_context (
              EXR_CONTEXT_FLAG_DISABLE_CHUNK_RECONSTRUCTION);
         ret->legacy_header =
             (initializers->flags & EXR_CONTEXT_FLAG_WRITE_LEGACY_HEADER);
+        ret->deterministic_write =
+            (initializers->flags & EXR_CONTEXT_FLAG_DETERMINISTIC_WRITE) ? 1
+                                                                         : 0;
 
         ret->file_size       = -1;
         ret->max_name_length = EXR_SHORTNAME_MAXLEN;
@@ -482,6 +485,7 @@ internal_exr_destroy_context (exr_context_t ctxt)
     exr_attr_string_destroy (ctxt, &(ctxt->filename));
     exr_attr_string_destroy (ctxt, &(ctxt->tmp_filename));
     exr_attr_list_destroy (ctxt, &(ctxt->custom_handlers));
+    internal_exr_spool_destroy (ctxt);
     internal_exr_destroy_parts (ctxt);
 #if ILMTHREAD_THREADING_ENABLED
 #    ifdef _WIN32

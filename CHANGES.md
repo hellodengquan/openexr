@@ -3,6 +3,7 @@
 
 # OpenEXR Release Notes
 
+* [Unreleased](#unreleased)
 * [Version 3.5.5](#version-355-november-22-2026) November 22, 2026
 * [Version 3.5.4](#version-354-november-11-2026) November 11, 2026
 * [Version 3.5.3](#version-353-october-30-2026) October 30, 2026
@@ -125,6 +126,26 @@
 * [Version 1.0.2](#version-102)
 * [Version 1.0.1](#version-101)
 * [Version 1.0](#version-10)
+
+## Unreleased
+
+* Added an optional deterministic multi-part write mode to the C core,
+  enabled with the new `EXR_CONTEXT_FLAG_DETERMINISTIC_WRITE` context
+  flag. Completed chunks are spooled in memory and emitted at
+  `exr_finish()` in a fixed order derived solely from the part
+  definitions and per-part storage conventions: parts in ascending
+  part-index order and chunks in ascending chunk-index order (the same
+  order used by the chunk offset table), regardless of producer
+  delivery order or which thread/part produced a chunk. Chunks may
+  therefore be produced concurrently and across parts while the physical
+  layout of parts and valid chunks stays reproducible, and each chunk
+  index still addresses its original channel data. If a chunk is never
+  produced, `exr_finish()` returns `EXR_ERR_INCOMPLETE_CHUNK_TABLE` and
+  retains the partial material (its missing offset-table entries stay
+  zero) rather than presenting it as a completed file; ordinary writes
+  keep their previous delivery-order behavior. New queries
+  `exr_get_written_chunk_count()` and `exr_is_deterministic_write()`
+  report write progress and the active mode.
 
 ## Version 3.5.5 (November 22, 2026)
 

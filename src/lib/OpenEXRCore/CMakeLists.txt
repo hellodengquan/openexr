@@ -38,6 +38,7 @@ openexr_define_library(OpenEXRCore
     internal_posix_file_impl.h
     internal_win32_file_impl.h
     internal_preview.h
+    internal_spool.h
     internal_string.h
     internal_string_vector.h
     internal_structs.h
@@ -92,6 +93,7 @@ openexr_define_library(OpenEXRCore
     pack.c
     unpack.c
     validation.c
+    internal_spool.c
 
     debug.c
 

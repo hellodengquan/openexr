@@ -8,6 +8,7 @@
 #include "internal_attr.h"
 #include "internal_constants.h"
 #include "internal_ht_quality.h"
+#include "internal_spool.h"
 #include "internal_structs.h"
 
 #include <math.h>
@@ -498,6 +499,59 @@ exr_validate_chunk_table (exr_context_t ctxt, int part_index)
 
     if (!complete) return EXR_ERR_INCOMPLETE_CHUNK_TABLE;
 
+    return EXR_ERR_SUCCESS;
+}
+
+/**************************************/
+
+exr_result_t
+exr_get_written_chunk_count (
+    exr_const_context_t ctxt, int part_index, int32_t* out)
+{
+    EXR_LOCK_WRITE_AND_DEFINE_PART (part_index);
+
+    if (!out)
+        return EXR_UNLOCK_WRITE_AND_RETURN (
+            ctxt->standard_error (ctxt, EXR_ERR_INVALID_ARGUMENT));
+
+    if (ctxt->mode != EXR_CONTEXT_WRITE &&
+        ctxt->mode != EXR_CONTEXT_WRITING_DATA &&
+        ctxt->mode != EXR_CONTEXT_WRITE_FINISHED)
+        return EXR_UNLOCK_WRITE_AND_RETURN (
+            ctxt->standard_error (ctxt, EXR_ERR_NOT_OPEN_WRITE));
+
+    if (ctxt->deterministic_write)
+    {
+        exr_result_t rv =
+            internal_exr_spool_part_count (ctxt, part_index, out);
+        if (ctxt->mode == EXR_CONTEXT_WRITE) internal_exr_unlock (ctxt);
+        return rv;
+    }
+
+    /* normal delivery-order write: only the current part can have
+     * chunks in flight, earlier parts are complete, later ones empty */
+    if (part_index < ctxt->cur_output_part)
+        *out = part->chunk_count;
+    else if (part_index == ctxt->cur_output_part)
+        *out = ctxt->output_chunk_count;
+    else
+        *out = 0;
+
+    if (ctxt->mode == EXR_CONTEXT_WRITE) internal_exr_unlock (ctxt);
+    return EXR_ERR_SUCCESS;
+}
+
+/**************************************/
+
+exr_result_t
+exr_is_deterministic_write (exr_const_context_t ctxt, int* out)
+{
+    if (!ctxt) return EXR_ERR_MISSING_CONTEXT_ARG;
+    if (!out) return ctxt->standard_error (ctxt, EXR_ERR_INVALID_ARGUMENT);
+
+    if (ctxt->mode == EXR_CONTEXT_WRITE) internal_exr_lock (ctxt);
+    *out = ctxt->deterministic_write ? 1 : 0;
+    if (ctxt->mode == EXR_CONTEXT_WRITE) internal_exr_unlock (ctxt);
     return EXR_ERR_SUCCESS;
 }
 

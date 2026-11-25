@@ -170,6 +170,33 @@ exr_get_chunk_table (exr_const_context_t ctxt, int part_index, uint64_t **table,
 EXR_EXPORT exr_result_t
 exr_validate_chunk_table (exr_context_t ctxt, int part_index);
 
+/** @brief Query how many chunks of a write context have been produced.
+ *
+ * For a context opened for write this reports write progress without
+ * needing to finish the file.
+ *
+ * In deterministic write mode
+ * (#EXR_CONTEXT_FLAG_DETERMINISTIC_WRITE) this counts the chunks that
+ * have been handed to the library for the given part, whether or not
+ * they have been flushed to the output yet (flushing happens once, in
+ * order, at exr_finish()). In the normal write mode it counts the
+ * chunks already written for the part currently being filled.
+ *
+ * The result is between 0 and the part's chunk count. Reading
+ * contexts are not valid arguments.
+ */
+EXR_EXPORT exr_result_t exr_get_written_chunk_count (
+    exr_const_context_t ctxt, int part_index, int32_t* out);
+
+/** @brief Whether the write context is using deterministic output.
+ *
+ * Returns 1 in @p out when the context was created with
+ * #EXR_CONTEXT_FLAG_DETERMINISTIC_WRITE and chunks are therefore being
+ * spooled for emission in canonical order at exr_finish(), 0 otherwise.
+ */
+EXR_EXPORT exr_result_t
+exr_is_deterministic_write (exr_const_context_t ctxt, int* out);
+
 /** Return the number of scanlines chunks for this file part.
  *
  * When iterating over a scanline file, this may be an easier metric

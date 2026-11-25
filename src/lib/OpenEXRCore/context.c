@@ -15,6 +15,7 @@
 
 #include "internal_constants.h"
 #include "internal_file.h"
+#include "internal_spool.h"
 #include "backward_compatibility.h"
 
 #if defined(_WIN32) || defined(_WIN64)
@@ -209,16 +210,58 @@ exr_finish (exr_context_t* pctxt)
     ctxt = *pctxt;
     if (ctxt)
     {
-        int failed = 0;
-        if (ctxt->mode == EXR_CONTEXT_WRITE ||
-            ctxt->mode == EXR_CONTEXT_WRITING_DATA)
+        int          failed = 0;
+        exr_result_t flushrv = EXR_ERR_SUCCESS;
+
+        /*
+         * Deterministic write mode spools the chunks in memory. Flush
+         * them in canonical order now. A flush that reports an
+         * incomplete chunk table still produced a readable partial
+         * file, which the caller must be able to tell apart from a
+         * completed one, so retain it rather than treating it as a
+         * failed write.
+         */
+        if (ctxt->mode == EXR_CONTEXT_WRITING_DATA &&
+            ctxt->deterministic_write)
+        {
+            flushrv = internal_exr_spool_flush (ctxt);
+            if (flushrv == EXR_ERR_SUCCESS ||
+                flushrv == EXR_ERR_INCOMPLETE_CHUNK_TABLE)
+                failed = 0;
+            else
+                failed = 1;
+        }
+        else if (ctxt->mode == EXR_CONTEXT_WRITE ||
+                 ctxt->mode == EXR_CONTEXT_WRITING_DATA)
+        {
+            /* header or data never finished: nothing valid to keep */
             failed = 1;
+        }
 
         if (ctxt->mode != EXR_CONTEXT_READ &&
             ctxt->mode != EXR_CONTEXT_TEMPORARY)
+        {
+            if (flushrv == EXR_ERR_INCOMPLETE_CHUNK_TABLE)
+            {
+                /* Keep the partial material: finalize_write will skip
+                 * both the unlink and the temp-file rename with this
+                 * flag set, so the final name only ever denotes a
+                 * complete file while the partial output survives. */
+                ctxt->keep_partial_output = 1;
+            }
             rv = finalize_write (ctxt, failed);
 
-        if (ctxt->destroy_fn) ctxt->destroy_fn (ctxt, ctxt->user_data, failed);
+            /* surface the "partial material" status even if finalize
+             * itself succeeded */
+            if (rv == EXR_ERR_SUCCESS &&
+                flushrv == EXR_ERR_INCOMPLETE_CHUNK_TABLE)
+                rv = flushrv;
+            else if (rv == EXR_ERR_SUCCESS && flushrv != EXR_ERR_SUCCESS)
+                rv = flushrv;
+        }
+
+        if (ctxt->destroy_fn)
+            ctxt->destroy_fn (ctxt, ctxt->user_data, failed);
 
         internal_exr_destroy_context (ctxt);
     }
@@ -739,6 +782,9 @@ exr_write_header (exr_context_t ctxt)
             ctxt->output_file_offset +=
                 (uint64_t) (curp->chunk_count) * sizeof (uint64_t);
         }
+
+        if (rv == EXR_ERR_SUCCESS && ctxt->deterministic_write)
+            rv = internal_exr_spool_init (ctxt);
     }
 
     return EXR_UNLOCK_AND_RETURN (rv);

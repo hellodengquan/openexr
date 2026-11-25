@@ -7,6 +7,7 @@
 
 #include "internal_coding.h"
 #include "internal_structs.h"
+#include "internal_spool.h"
 #include "internal_util.h"
 #include "internal_xdr.h"
 #include "internal_file.h"
@@ -1674,6 +1675,42 @@ exr_read_deep_chunk (
 
 /**************************************/
 
+/* Bookkeeping shared by the normal write path and the deterministic
+ * spool flush: record the chunk table entry when the last chunk of a
+ * part lands, write that part's offset table, and advance to the next
+ * part. Called with the context lock held. */
+exr_result_t
+internal_exr_complete_output_part (
+    exr_context_t ctxt, exr_priv_part_t part)
+{
+    exr_result_t rv  = EXR_ERR_SUCCESS;
+    uint64_t*    ctable;
+    uint64_t     chunkoff;
+
+    rv = alloc_chunk_table (ctxt, part, &ctable);
+    if (rv != EXR_ERR_SUCCESS) return rv;
+
+    ++(ctxt->cur_output_part);
+    if (ctxt->cur_output_part == ctxt->num_parts)
+        ctxt->mode = EXR_CONTEXT_WRITE_FINISHED;
+    ctxt->last_output_chunk  = -1;
+    ctxt->output_chunk_count = 0;
+
+    chunkoff = part->chunk_table_offset;
+    priv_from_native64 (ctable, part->chunk_count);
+    rv = ctxt->do_write (
+        ctxt,
+        ctable,
+        sizeof (uint64_t) * (uint64_t) (part->chunk_count),
+        &chunkoff);
+    /* just in case we look at it again? */
+    priv_to_native64 (ctable, part->chunk_count);
+
+    return rv;
+}
+
+/**************************************/
+
 /* pull most of the logic to here to avoid having to unlock at every
  * error exit point and re-use mostly shared logic */
 static exr_result_t
@@ -1707,7 +1744,7 @@ write_scan_chunk (
         return ctxt->standard_error (ctxt, EXR_ERR_SCAN_TILE_MIXEDAPI);
     }
 
-    if (ctxt->cur_output_part != part_index)
+    if (!ctxt->deterministic_write && ctxt->cur_output_part != part_index)
         return ctxt->standard_error (ctxt, EXR_ERR_INCORRECT_PART);
 
     if (packed_size > 0 && !packed_data)
@@ -1779,7 +1816,26 @@ write_scan_chunk (
             part->chunk_count);
     }
 
+    if (ctxt->deterministic_write && !ctxt->spool_flushing)
+    {
+        return internal_exr_spool_store (
+            ctxt,
+            part_index,
+            cidx,
+            part->data_window.min.x,
+            miny,
+            0,
+            0,
+            (uint8_t) part->storage_mode,
+            packed_data,
+            packed_size,
+            unpacked_size,
+            sample_data,
+            sample_data_size);
+    }
+
     if (part->lineorder != EXR_LINEORDER_RANDOM_Y &&
+        !ctxt->spool_flushing &&
         ctxt->last_output_chunk != (cidx - 1))
     {
         return ctxt->standard_error (ctxt, EXR_ERR_INCORRECT_CHUNK);
@@ -1844,25 +1900,9 @@ write_scan_chunk (
     {
         ++(ctxt->output_chunk_count);
         if (ctxt->output_chunk_count == part->chunk_count)
-        {
-            uint64_t chunkoff = part->chunk_table_offset;
+            return internal_exr_complete_output_part (ctxt, part);
 
-            ++(ctxt->cur_output_part);
-            if (ctxt->cur_output_part == ctxt->num_parts)
-                ctxt->mode = EXR_CONTEXT_WRITE_FINISHED;
-            ctxt->last_output_chunk  = -1;
-            ctxt->output_chunk_count = 0;
-
-            priv_from_native64 (ctable, part->chunk_count);
-            rv = ctxt->do_write (
-                ctxt,
-                ctable,
-                sizeof (uint64_t) * (uint64_t) (part->chunk_count),
-                &chunkoff);
-            /* just in case we look at it again? */
-            priv_to_native64 (ctable, part->chunk_count);
-        }
-        else { ctxt->last_output_chunk = cidx; }
+        ctxt->last_output_chunk = cidx;
     }
 
     return rv;
@@ -2154,7 +2194,7 @@ write_tile_chunk (
         return ctxt->standard_error (ctxt, EXR_ERR_TILE_SCAN_MIXEDAPI);
     }
 
-    if (ctxt->cur_output_part != part_index)
+    if (!ctxt->deterministic_write && ctxt->cur_output_part != part_index)
         return ctxt->standard_error (ctxt, EXR_ERR_INCORRECT_PART);
 
     if (!packed_data || packed_size == 0)
@@ -2203,7 +2243,26 @@ write_tile_chunk (
             part->chunk_count);
     }
 
+    if (ctxt->deterministic_write && !ctxt->spool_flushing)
+    {
+        return internal_exr_spool_store (
+            ctxt,
+            part_index,
+            cidx,
+            tilex,
+            tiley,
+            (uint8_t) levelx,
+            (uint8_t) levely,
+            (uint8_t) part->storage_mode,
+            packed_data,
+            packed_size,
+            unpacked_size,
+            sample_data,
+            sample_data_size);
+    }
+
     if (part->lineorder != EXR_LINEORDER_RANDOM_Y &&
+        !ctxt->spool_flushing &&
         ctxt->last_output_chunk != (cidx - 1))
     {
         return ctxt->print_error (
@@ -2260,25 +2319,9 @@ write_tile_chunk (
     {
         ++(ctxt->output_chunk_count);
         if (ctxt->output_chunk_count == part->chunk_count)
-        {
-            uint64_t chunkoff = part->chunk_table_offset;
+            return internal_exr_complete_output_part (ctxt, part);
 
-            ++(ctxt->cur_output_part);
-            if (ctxt->cur_output_part == ctxt->num_parts)
-                ctxt->mode = EXR_CONTEXT_WRITE_FINISHED;
-            ctxt->last_output_chunk  = -1;
-            ctxt->output_chunk_count = 0;
-
-            priv_from_native64 (ctable, part->chunk_count);
-            rv = ctxt->do_write (
-                ctxt,
-                ctable,
-                sizeof (uint64_t) * (uint64_t) (part->chunk_count),
-                &chunkoff);
-            /* just in case we look at it again? */
-            priv_to_native64 (ctable, part->chunk_count);
-        }
-        else { ctxt->last_output_chunk = cidx; }
+        ctxt->last_output_chunk = cidx;
     }
 
     return rv;
@@ -2370,11 +2413,11 @@ internal_validate_next_chunk (
     exr_result_t rv = EXR_ERR_SUCCESS;
     int          cidx, lpc;
 
-    if (ctxt->cur_output_part != encode->part_index)
+    if (!ctxt->deterministic_write &&
+        ctxt->cur_output_part != encode->part_index)
         return ctxt->standard_error (ctxt, EXR_ERR_INCORRECT_PART);
 
     cidx = -1;
-
     if (part->storage_mode == EXR_STORAGE_TILED ||
         part->storage_mode == EXR_STORAGE_DEEP_TILED)
     {
@@ -2413,6 +2456,7 @@ internal_validate_next_chunk (
         }
         else if (
             part->lineorder != EXR_LINEORDER_RANDOM_Y &&
+            !ctxt->deterministic_write &&
             ctxt->last_output_chunk != (cidx - 1))
         {
             rv = ctxt->print_error (

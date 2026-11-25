@@ -141,6 +141,17 @@ public:
         return *this;
     }
 
+    /// Spool completed chunks in memory and emit them in a fixed
+    /// part/chunk index order at close, so the physical layout of a
+    /// multi-part file is reproducible regardless of producer delivery
+    /// order. See exr_context.h for the full semantics, including how a
+    /// file with missing chunks is reported at finish.
+    ContextInitializer& deterministicWrite (bool onoff) noexcept
+    {
+        setFlag (EXR_CONTEXT_FLAG_DETERMINISTIC_WRITE, onoff);
+        return *this;
+    }
+
 private:
     void setFlag (const int flag, bool onoff)
     {

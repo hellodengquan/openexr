@@ -9,6 +9,7 @@
 #include <strsafe.h>
 #else
 #include <unistd.h>
+#include <glob.h>
 #endif
 
 #include "write.h"
@@ -26,6 +27,8 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <thread>
+#include <vector>
 
 static void
 err_cb (exr_const_context_t f, exr_result_t code, const char* msg)
@@ -1753,4 +1756,802 @@ testStartWriteUTF8 (const std::string& tempdir)
     EXRCORE_TEST ( access (outfn.c_str (), F_OK) != -1 );
     remove (outfn.c_str ());
 #endif
+}
+
+//
+// Deterministic multi-part output.
+//
+// Producers hand chunks over in arbitrary order (and across parts);
+// with EXR_CONTEXT_FLAG_DETERMINISTIC_WRITE the library must spool them
+// and emit a fixed physical order at finish, keep the missing-chunk
+// case distinguishable from a completed file, and leave the normal
+// delivery-order behavior untouched when the flag is not set.
+//
+
+namespace
+{
+
+// Build a small scanline part: width x height, one FLOAT channel whose
+// pixel value encodes (part, chunk index) so a round trip can tell
+// chunks apart.
+void
+define_scan_part (
+    exr_context_t f,
+    int           part,
+    int           width,
+    int           height,
+    int           lines_per_chunk)
+{
+    EXRCORE_TEST_RVAL (exr_initialize_required_attr_simple (
+        f, part, width, height, EXR_COMPRESSION_NONE));
+    exr_attr_box2i_t dw = {{0, 0}, {width - 1, height - 1}};
+    EXRCORE_TEST_RVAL (exr_set_data_window (f, part, &dw));
+    EXRCORE_TEST_RVAL (exr_add_channel (
+        f, part, "V", EXR_PIXEL_FLOAT, EXR_PERCEPTUALLY_LOGARITHMIC, 1, 1));
+    (void) lines_per_chunk;
+}
+
+// Encode and deliver one scanline chunk to the (possibly deterministic)
+// context. Pixel values are (float)(part * 1000 + chunk) so every chunk
+// has distinct, checkable contents.
+void
+deliver_scan_chunk (
+    exr_context_t f,
+    int           part,
+    int           width,
+    int           chunk,
+    int           lines_per_chunk)
+{
+    int                y = chunk * lines_per_chunk;
+    exr_chunk_info_t   cinfo;
+    exr_encode_pipeline_t encoder = EXR_ENCODE_PIPELINE_INITIALIZER;
+
+    EXRCORE_TEST_RVAL (exr_write_scanline_chunk_info (f, part, y, &cinfo));
+    EXRCORE_TEST_RVAL (exr_encoding_initialize (f, part, &cinfo, &encoder));
+    EXRCORE_TEST (encoder.channel_count == 1);
+
+    std::unique_ptr<float[]> pixels (
+        new float[(size_t) width * (size_t) cinfo.height]);
+    for (int32_t i = 0; i < width * cinfo.height; ++i)
+        pixels[i] = (float) (part * 1000 + chunk);
+
+    encoder.channels[0].encode_from_ptr   = (const uint8_t*) pixels.get ();
+    encoder.channels[0].user_pixel_stride = (int) sizeof (float);
+    encoder.channels[0].user_line_stride  = width * (int) sizeof (float);
+
+    EXRCORE_TEST_RVAL (
+        exr_encoding_choose_default_routines (f, part, &encoder));
+    EXRCORE_TEST_RVAL (exr_encoding_run (f, part, &encoder));
+    EXRCORE_TEST_RVAL (exr_encoding_destroy (f, &encoder));
+}
+
+// Read back one scanline chunk and confirm every pixel matches the
+// (part, chunk) marker it was written with, i.e. chunk index still maps
+// to the same channel data after the reordered write.
+void
+check_scan_chunk (
+    exr_const_context_t f,
+    int                 part,
+    int                 width,
+    int                 chunk,
+    int                 lines_per_chunk)
+{
+    int                y = chunk * lines_per_chunk;
+    exr_chunk_info_t   cinfo;
+    exr_decode_pipeline_t decoder = EXR_DECODE_PIPELINE_INITIALIZER;
+
+    EXRCORE_TEST_RVAL (exr_read_scanline_chunk_info (f, part, y, &cinfo));
+    EXRCORE_TEST_RVAL (exr_decoding_initialize (f, part, &cinfo, &decoder));
+    EXRCORE_TEST (decoder.channel_count == 1);
+
+    std::unique_ptr<float[]> pixels (
+        new float[(size_t) width * (size_t) cinfo.height]);
+    decoder.channels[0].decode_to_ptr     = (uint8_t*) pixels.get ();
+    decoder.channels[0].user_pixel_stride = (int) sizeof (float);
+    decoder.channels[0].user_line_stride  = width * (int) sizeof (float);
+
+    EXRCORE_TEST_RVAL (
+        exr_decoding_choose_default_routines (f, part, &decoder));
+    EXRCORE_TEST_RVAL (exr_decoding_run (f, part, &decoder));
+    EXRCORE_TEST_RVAL (exr_decoding_destroy (f, &decoder));
+
+    const float expected = (float) (part * 1000 + chunk);
+    for (int32_t i = 0; i < width * cinfo.height; ++i)
+        EXRCORE_TEST (pixels[i] == expected);
+}
+
+} // namespace
+
+void
+testWriteDeterministic (const std::string& tempdir)
+{
+    const int width           = 4;
+    const int height          = 4;
+    const int lines_per_chunk = 1;
+    const int nchunks         = height / lines_per_chunk;
+    const int nparts          = 3;
+
+    /* ---- 1. deterministic write, chunks delivered out of order and
+     *        interleaved across parts ---- */
+    {
+        std::string               fn = tempdir + "deterministic.exr";
+        exr_context_t             f;
+        exr_context_initializer_t cinit = EXR_DEFAULT_CONTEXT_INITIALIZER;
+        cinit.error_handler_fn          = &err_cb;
+        cinit.flags |= EXR_CONTEXT_FLAG_DETERMINISTIC_WRITE;
+
+        EXRCORE_TEST_RVAL (
+            exr_start_write (&f, fn.c_str (), EXR_WRITE_FILE_DIRECTLY, &cinit));
+
+        int isdet = -1;
+        EXRCORE_TEST_RVAL (exr_is_deterministic_write (f, &isdet));
+        EXRCORE_TEST (isdet == 1);
+
+        int pidx = -1;
+        for (int p = 0; p < nparts; ++p)
+        {
+            char name[16];
+            snprintf (name, sizeof (name), "layer%d", p);
+            EXRCORE_TEST_RVAL (
+                exr_add_part (f, name, EXR_STORAGE_SCANLINE, &pidx));
+            EXRCORE_TEST (pidx == p);
+            define_scan_part (f, p, width, height, lines_per_chunk);
+        }
+        EXRCORE_TEST_RVAL (exr_write_header (f));
+
+        int32_t chunk_count = -1;
+        EXRCORE_TEST_RVAL (exr_get_chunk_count (f, 0, &chunk_count));
+        EXRCORE_TEST (chunk_count == nchunks);
+
+        /* nothing produced yet */
+        for (int p = 0; p < nparts; ++p)
+        {
+            int32_t written = -1;
+            EXRCORE_TEST_RVAL (
+                exr_get_written_chunk_count (f, p, &written));
+            EXRCORE_TEST (written == 0);
+        }
+
+        /* deliberately scrambled, interleaved delivery order */
+        const int order[][2] = {
+            {2, 3}, {0, 2}, {1, 0}, {2, 0}, {0, 3}, {1, 2},
+            {0, 0}, {2, 2}, {1, 3}, {2, 1}, {0, 1}, {1, 1}};
+        for (const auto& req: order)
+        {
+            deliver_scan_chunk (
+                f, req[0], width, req[1], lines_per_chunk);
+            int32_t written = -1;
+            EXRCORE_TEST_RVAL (
+                exr_get_written_chunk_count (f, req[0], &written));
+            EXRCORE_TEST (written > 0);
+        }
+
+        for (int p = 0; p < nparts; ++p)
+        {
+            int32_t written = -1;
+            EXRCORE_TEST_RVAL (
+                exr_get_written_chunk_count (f, p, &written));
+            EXRCORE_TEST (written == nchunks);
+        }
+
+        EXRCORE_TEST_RVAL (exr_finish (&f));
+
+        /* ---- physical layout must be reproducible: parts and chunks
+         *      appear in ascending index order on disk ---- */
+        exr_context_t             rf;
+        exr_context_initializer_t rinit = EXR_DEFAULT_CONTEXT_INITIALIZER;
+        rinit.error_handler_fn          = &err_cb;
+        EXRCORE_TEST_RVAL (
+            exr_start_read (&rf, fn.c_str (), &rinit));
+
+        int rparts = -1;
+        EXRCORE_TEST_RVAL (exr_get_count (rf, &rparts));
+        EXRCORE_TEST (rparts == nparts);
+
+        uint64_t prev_end = 0;
+        for (int p = 0; p < nparts; ++p)
+        {
+            int32_t   cnt = -1;
+            uint64_t* table = NULL;
+            EXRCORE_TEST_RVAL (
+                exr_get_chunk_table (rf, p, &table, &cnt));
+            EXRCORE_TEST (cnt == nchunks);
+
+            /* chunk table itself is in ascending chunk-index order */
+            for (int c = 0; c < cnt; ++c)
+            {
+                EXRCORE_TEST (table[c] != 0);
+                if (c > 0) EXRCORE_TEST (table[c] > table[c - 1]);
+            }
+            /* parts are contiguous and ordered: this part starts after
+             * the previous one's data */
+            if (p > 0) EXRCORE_TEST (table[0] >= prev_end);
+            prev_end = table[cnt - 1];
+
+            EXRCORE_TEST_RVAL (exr_validate_chunk_table (rf, p));
+
+            /* index still addresses the channel data written for it */
+            for (int c = 0; c < cnt; ++c)
+                check_scan_chunk (rf, p, width, c, lines_per_chunk);
+        }
+        EXRCORE_TEST_RVAL (exr_finish (&rf));
+        remove (fn.c_str ());
+    }
+
+    /* ---- 2. same inputs through both modes must agree on layout ---- */
+    {
+        std::string fn_det = tempdir + "mode_det.exr";
+        std::string fn_ref = tempdir + "mode_ref.exr";
+
+        for (int deterministic = 0; deterministic <= 1; ++deterministic)
+        {
+            const std::string&      fn = deterministic ? fn_det : fn_ref;
+            exr_context_t           f;
+            exr_context_initializer_t cinit = EXR_DEFAULT_CONTEXT_INITIALIZER;
+            cinit.error_handler_fn          = &err_cb;
+            if (deterministic)
+                cinit.flags |= EXR_CONTEXT_FLAG_DETERMINISTIC_WRITE;
+
+            EXRCORE_TEST_RVAL (exr_start_write (
+                &f, fn.c_str (), EXR_WRITE_FILE_DIRECTLY, &cinit));
+
+            int pidx = -1;
+            EXRCORE_TEST_RVAL (
+                exr_add_part (f, "a", EXR_STORAGE_SCANLINE, &pidx));
+            define_scan_part (f, 0, width, height, lines_per_chunk);
+            EXRCORE_TEST_RVAL (
+                exr_add_part (f, "b", EXR_STORAGE_SCANLINE, &pidx));
+            define_scan_part (f, 1, width, height, lines_per_chunk);
+            EXRCORE_TEST_RVAL (exr_write_header (f));
+
+            if (deterministic)
+            {
+                /* reversed delivery, still must come out canonical */
+                for (int p = 1; p >= 0; --p)
+                    for (int c = nchunks - 1; c >= 0; --c)
+                        deliver_scan_chunk (f, p, width, c, lines_per_chunk);
+            }
+            else
+            {
+                for (int p = 0; p < 2; ++p)
+                    for (int c = 0; c < nchunks; ++c)
+                        deliver_scan_chunk (f, p, width, c, lines_per_chunk);
+            }
+            EXRCORE_TEST_RVAL (exr_finish (&f));
+        }
+
+        /* the chunk offset tables of the two files must be identical */
+        exr_context_t             f1, f2;
+        exr_context_initializer_t rinit = EXR_DEFAULT_CONTEXT_INITIALIZER;
+        rinit.error_handler_fn          = &err_cb;
+        EXRCORE_TEST_RVAL (exr_start_read (&f1, fn_det.c_str (), &rinit));
+        EXRCORE_TEST_RVAL (exr_start_read (&f2, fn_ref.c_str (), &rinit));
+        for (int p = 0; p < 2; ++p)
+        {
+            int32_t   c1 = 0, c2 = 0;
+            uint64_t *t1 = NULL, *t2 = NULL;
+            EXRCORE_TEST_RVAL (exr_get_chunk_table (f1, p, &t1, &c1));
+            EXRCORE_TEST_RVAL (exr_get_chunk_table (f2, p, &t2, &c2));
+            EXRCORE_TEST (c1 == c2);
+            for (int c = 0; c < c1; ++c)
+                EXRCORE_TEST (t1[c] == t2[c]);
+        }
+        EXRCORE_TEST_RVAL (exr_finish (&f1));
+        EXRCORE_TEST_RVAL (exr_finish (&f2));
+        remove (fn_det.c_str ());
+        remove (fn_ref.c_str ());
+    }
+
+    /* ---- 3. missing chunks: finish reports partial material but
+     *        keeps the file, and the produced chunks are readable ---- */
+    {
+        std::string               fn = tempdir + "deterministic_partial.exr";
+        exr_context_t             f;
+        exr_context_initializer_t cinit = EXR_DEFAULT_CONTEXT_INITIALIZER;
+        cinit.error_handler_fn          = &err_cb;
+        cinit.flags |= EXR_CONTEXT_FLAG_DETERMINISTIC_WRITE;
+
+        EXRCORE_TEST_RVAL (
+            exr_start_write (&f, fn.c_str (), EXR_WRITE_FILE_DIRECTLY, &cinit));
+        int pidx = -1;
+        EXRCORE_TEST_RVAL (
+            exr_add_part (f, "only", EXR_STORAGE_SCANLINE, &pidx));
+        define_scan_part (f, 0, width, height, lines_per_chunk);
+        EXRCORE_TEST_RVAL (exr_write_header (f));
+
+        /* deliver every chunk except the last one */
+        for (int c = 0; c < nchunks - 1; ++c)
+            deliver_scan_chunk (f, 0, width, c, lines_per_chunk);
+
+        EXRCORE_TEST_RVAL_FAIL (
+            EXR_ERR_INCOMPLETE_CHUNK_TABLE, exr_finish (&f));
+#ifndef _WIN32
+        /* the partial material is retained rather than deleted */
+        EXRCORE_TEST (access (fn.c_str (), F_OK) != -1);
+#endif
+
+        exr_context_t             rf;
+        exr_context_initializer_t rinit = EXR_DEFAULT_CONTEXT_INITIALIZER;
+        rinit.error_handler_fn          = &err_cb;
+        EXRCORE_TEST_RVAL (exr_start_read (&rf, fn.c_str (), &rinit));
+
+        /* the table as a whole is incomplete ... */
+        EXRCORE_TEST_RVAL_FAIL (
+            EXR_ERR_INCOMPLETE_CHUNK_TABLE,
+            exr_validate_chunk_table (rf, 0));
+
+        int32_t   cnt = -1;
+        uint64_t* table = NULL;
+        EXRCORE_TEST_RVAL (exr_get_chunk_table (rf, 0, &table, &cnt));
+        EXRCORE_TEST (cnt == nchunks);
+        /* ... the missing chunk has a zero offset, the rest valid ... */
+        for (int c = 0; c < cnt; ++c)
+            EXRCORE_TEST ((c < cnt - 1) == (table[c] != 0));
+
+        /* ... and the chunks that did arrive keep their indexed data */
+        for (int c = 0; c < cnt - 1; ++c)
+            check_scan_chunk (rf, 0, width, c, lines_per_chunk);
+
+        EXRCORE_TEST_RVAL (exr_finish (&rf));
+        remove (fn.c_str ());
+    }
+
+    /* ---- 3b. missing chunk in a middle part of a multi-part file:
+     *         later parts must still land in their own chunk space ---- */
+    {
+        std::string               fn = tempdir + "deterministic_mpartial.exr";
+        exr_context_t             f;
+        exr_context_initializer_t cinit = EXR_DEFAULT_CONTEXT_INITIALIZER;
+        cinit.error_handler_fn          = &err_cb;
+        cinit.flags |= EXR_CONTEXT_FLAG_DETERMINISTIC_WRITE;
+
+        EXRCORE_TEST_RVAL (
+            exr_start_write (&f, fn.c_str (), EXR_WRITE_FILE_DIRECTLY, &cinit));
+        for (int p = 0; p < nparts; ++p)
+        {
+            char name[16];
+            snprintf (name, sizeof (name), "m%d", p);
+            int pidx = -1;
+            EXRCORE_TEST_RVAL (
+                exr_add_part (f, name, EXR_STORAGE_SCANLINE, &pidx));
+            define_scan_part (f, p, width, height, lines_per_chunk);
+        }
+        EXRCORE_TEST_RVAL (exr_write_header (f));
+
+        for (int p = 0; p < nparts; ++p)
+            for (int c = 0; c < nchunks; ++c)
+                /* part 1 loses its middle chunk */
+                if (!(p == 1 && c == 1))
+                    deliver_scan_chunk (f, p, width, c, lines_per_chunk);
+
+        EXRCORE_TEST_RVAL_FAIL (
+            EXR_ERR_INCOMPLETE_CHUNK_TABLE, exr_finish (&f));
+
+        exr_context_t             rf;
+        exr_context_initializer_t rinit = EXR_DEFAULT_CONTEXT_INITIALIZER;
+        rinit.error_handler_fn          = &err_cb;
+        EXRCORE_TEST_RVAL (exr_start_read (&rf, fn.c_str (), &rinit));
+
+        /* complete parts validate, the gappy one does not */
+        EXRCORE_TEST_RVAL (exr_validate_chunk_table (rf, 0));
+        EXRCORE_TEST_RVAL_FAIL (
+            EXR_ERR_INCOMPLETE_CHUNK_TABLE,
+            exr_validate_chunk_table (rf, 1));
+        EXRCORE_TEST_RVAL (exr_validate_chunk_table (rf, 2));
+
+        /* each part's chunk table must occupy its own, contiguous range
+         * of the file and the surviving entries must be strictly
+         * increasing: this fails if the gappy part completed early and
+         * absorbed the next part's chunks */
+        uint64_t prev_part_end = 0;
+        for (int p = 0; p < nparts; ++p)
+        {
+            int32_t   cnt = -1;
+            uint64_t* table = NULL;
+            EXRCORE_TEST_RVAL (
+                exr_get_chunk_table (rf, p, &table, &cnt));
+            EXRCORE_TEST (cnt == nchunks);
+            uint64_t last = 0;
+            for (int c = 0; c < cnt; ++c)
+            {
+                if (table[c] != 0)
+                {
+                    EXRCORE_TEST (table[c] > last);
+                    if (p > 0) EXRCORE_TEST (table[c] >= prev_part_end);
+                    last = table[c];
+                }
+            }
+            /* every part produced at least one chunk here */
+            EXRCORE_TEST (last != 0);
+            prev_part_end = last;
+        }
+
+        /* all surviving chunks keep their indexed data, including the
+         * part after the gappy one */
+        for (int p = 0; p < nparts; ++p)
+            for (int c = 0; c < nchunks; ++c)
+                if (!(p == 1 && c == 1))
+                    check_scan_chunk (rf, p, width, c, lines_per_chunk);
+
+        EXRCORE_TEST_RVAL (exr_finish (&rf));
+        remove (fn.c_str ());
+    }
+
+    /* ---- 3c. an entire middle part missing: its table is all zero and
+     *         the surrounding parts still keep their own chunk ranges ---- */
+    {
+        std::string               fn = tempdir + "deterministic_emptypart.exr";
+        exr_context_t             f;
+        exr_context_initializer_t cinit = EXR_DEFAULT_CONTEXT_INITIALIZER;
+        cinit.error_handler_fn          = &err_cb;
+        cinit.flags |= EXR_CONTEXT_FLAG_DETERMINISTIC_WRITE;
+
+        EXRCORE_TEST_RVAL (
+            exr_start_write (&f, fn.c_str (), EXR_WRITE_FILE_DIRECTLY, &cinit));
+        for (int p = 0; p < nparts; ++p)
+        {
+            char name[16];
+            snprintf (name, sizeof (name), "e%d", p);
+            int pidx = -1;
+            EXRCORE_TEST_RVAL (
+                exr_add_part (f, name, EXR_STORAGE_SCANLINE, &pidx));
+            define_scan_part (f, p, width, height, lines_per_chunk);
+        }
+        EXRCORE_TEST_RVAL (exr_write_header (f));
+
+        /* part 1 produces nothing at all */
+        for (int p = 0; p < nparts; ++p)
+            if (p != 1)
+                for (int c = 0; c < nchunks; ++c)
+                    deliver_scan_chunk (f, p, width, c, lines_per_chunk);
+
+        EXRCORE_TEST_RVAL_FAIL (
+            EXR_ERR_INCOMPLETE_CHUNK_TABLE, exr_finish (&f));
+
+        exr_context_t             rf;
+        exr_context_initializer_t rinit = EXR_DEFAULT_CONTEXT_INITIALIZER;
+        rinit.error_handler_fn          = &err_cb;
+        EXRCORE_TEST_RVAL (exr_start_read (&rf, fn.c_str (), &rinit));
+
+        int32_t   cnt = -1;
+        uint64_t* table = NULL;
+        EXRCORE_TEST_RVAL (exr_get_chunk_table (rf, 1, &table, &cnt));
+        EXRCORE_TEST (cnt == nchunks);
+        for (int c = 0; c < cnt; ++c) EXRCORE_TEST (table[c] == 0);
+
+        EXRCORE_TEST_RVAL (exr_validate_chunk_table (rf, 0));
+        EXRCORE_TEST_RVAL_FAIL (
+            EXR_ERR_INCOMPLETE_CHUNK_TABLE,
+            exr_validate_chunk_table (rf, 1));
+        EXRCORE_TEST_RVAL (exr_validate_chunk_table (rf, 2));
+
+        for (int c = 0; c < nchunks; ++c)
+        {
+            check_scan_chunk (rf, 0, width, c, lines_per_chunk);
+            check_scan_chunk (rf, 2, width, c, lines_per_chunk);
+        }
+        EXRCORE_TEST_RVAL (exr_finish (&rf));
+        remove (fn.c_str ());
+    }
+
+    /* ---- 4. tiled parts must be canonicalized through the same path ---- */
+    {
+        std::string               fn = tempdir + "deterministic_tiled.exr";
+        exr_context_t             f;
+        exr_context_initializer_t cinit = EXR_DEFAULT_CONTEXT_INITIALIZER;
+        cinit.error_handler_fn          = &err_cb;
+        cinit.flags |= EXR_CONTEXT_FLAG_DETERMINISTIC_WRITE;
+
+        const int tw = 2, th = 2;
+        const int ntx = (width + tw - 1) / tw;
+        const int nty = (height + th - 1) / th;
+
+        EXRCORE_TEST_RVAL (
+            exr_start_write (&f, fn.c_str (), EXR_WRITE_FILE_DIRECTLY, &cinit));
+        int pidx = -1;
+        EXRCORE_TEST_RVAL (
+            exr_add_part (f, "tiles", EXR_STORAGE_TILED, &pidx));
+        EXRCORE_TEST_RVAL (exr_initialize_required_attr_simple (
+            f, 0, width, height, EXR_COMPRESSION_NONE));
+        exr_attr_box2i_t dw = {{0, 0}, {width - 1, height - 1}};
+        EXRCORE_TEST_RVAL (exr_set_data_window (f, 0, &dw));
+        EXRCORE_TEST_RVAL (exr_add_channel (
+            f, 0, "V", EXR_PIXEL_FLOAT, EXR_PERCEPTUALLY_LOGARITHMIC, 1, 1));
+        EXRCORE_TEST_RVAL (exr_set_tile_descriptor (
+            f, 0, tw, th, EXR_TILE_ONE_LEVEL, EXR_TILE_ROUND_DOWN));
+        EXRCORE_TEST_RVAL (exr_write_header (f));
+
+        int32_t tchunks = -1;
+        EXRCORE_TEST_RVAL (exr_get_chunk_count (f, 0, &tchunks));
+        EXRCORE_TEST (tchunks == ntx * nty);
+
+        /* deliver tiles in reverse y/x order */
+        for (int ty = nty - 1; ty >= 0; --ty)
+        {
+            for (int tx = ntx - 1; tx >= 0; --tx)
+            {
+                exr_chunk_info_t      cinfo;
+                exr_encode_pipeline_t encoder =
+                    EXR_ENCODE_PIPELINE_INITIALIZER;
+                EXRCORE_TEST_RVAL (exr_write_tile_chunk_info (
+                    f, 0, tx, ty, 0, 0, &cinfo));
+                EXRCORE_TEST_RVAL (
+                    exr_encoding_initialize (f, 0, &cinfo, &encoder));
+
+                std::unique_ptr<float[]> pixels (
+                    new float[(size_t) cinfo.width * cinfo.height]);
+                for (int32_t i = 0; i < cinfo.width * cinfo.height; ++i)
+                    pixels[i] = (float) (ty * ntx + tx);
+
+                encoder.channels[0].encode_from_ptr =
+                    (const uint8_t*) pixels.get ();
+                encoder.channels[0].user_pixel_stride =
+                    (int) sizeof (float);
+                encoder.channels[0].user_line_stride =
+                    cinfo.width * (int) sizeof (float);
+                EXRCORE_TEST_RVAL (
+                    exr_encoding_choose_default_routines (f, 0, &encoder));
+                EXRCORE_TEST_RVAL (exr_encoding_run (f, 0, &encoder));
+                EXRCORE_TEST_RVAL (exr_encoding_destroy (f, &encoder));
+            }
+        }
+        EXRCORE_TEST_RVAL (exr_finish (&f));
+
+        exr_context_t             rf;
+        exr_context_initializer_t rinit = EXR_DEFAULT_CONTEXT_INITIALIZER;
+        rinit.error_handler_fn          = &err_cb;
+        EXRCORE_TEST_RVAL (exr_start_read (&rf, fn.c_str (), &rinit));
+        EXRCORE_TEST_RVAL (exr_validate_chunk_table (rf, 0));
+
+        int32_t   cnt = -1;
+        uint64_t* table = NULL;
+        EXRCORE_TEST_RVAL (exr_get_chunk_table (rf, 0, &table, &cnt));
+        EXRCORE_TEST (cnt == tchunks);
+        for (int c = 1; c < cnt; ++c)
+            EXRCORE_TEST (table[c] > table[c - 1]);
+
+        /* indexed tile reads still map to the right coordinates/data */
+        for (int ty = 0; ty < nty; ++ty)
+            for (int tx = 0; tx < ntx; ++tx)
+            {
+                exr_chunk_info_t      cinfo;
+                exr_decode_pipeline_t decoder =
+                    EXR_DECODE_PIPELINE_INITIALIZER;
+                EXRCORE_TEST_RVAL (exr_read_tile_chunk_info (
+                    rf, 0, tx, ty, 0, 0, &cinfo));
+                EXRCORE_TEST_RVAL (
+                    exr_decoding_initialize (rf, 0, &cinfo, &decoder));
+                std::unique_ptr<float[]> pixels (
+                    new float[(size_t) cinfo.width * cinfo.height]);
+                decoder.channels[0].decode_to_ptr =
+                    (uint8_t*) pixels.get ();
+                decoder.channels[0].user_pixel_stride =
+                    (int) sizeof (float);
+                decoder.channels[0].user_line_stride =
+                    cinfo.width * (int) sizeof (float);
+                EXRCORE_TEST_RVAL (
+                    exr_decoding_choose_default_routines (rf, 0, &decoder));
+                EXRCORE_TEST_RVAL (exr_decoding_run (rf, 0, &decoder));
+                EXRCORE_TEST_RVAL (exr_decoding_destroy (rf, &decoder));
+                const float expected = (float) (ty * ntx + tx);
+                for (int32_t i = 0; i < cinfo.width * cinfo.height; ++i)
+                    EXRCORE_TEST (pixels[i] == expected);
+            }
+        EXRCORE_TEST_RVAL (exr_finish (&rf));
+        remove (fn.c_str ());
+    }
+
+    /* ---- 5. concurrent producers deliver arbitrary parts/chunks from
+     *        several threads; the spool + context lock must serialize
+     *        them and the output stay canonical ---- */
+    {
+        std::string               fn = tempdir + "deterministic_threads.exr";
+        exr_context_t             f;
+        exr_context_initializer_t cinit = EXR_DEFAULT_CONTEXT_INITIALIZER;
+        cinit.error_handler_fn          = &err_cb;
+        cinit.flags |= EXR_CONTEXT_FLAG_DETERMINISTIC_WRITE;
+
+        EXRCORE_TEST_RVAL (
+            exr_start_write (&f, fn.c_str (), EXR_WRITE_FILE_DIRECTLY, &cinit));
+        for (int p = 0; p < nparts; ++p)
+        {
+            char name[16];
+            snprintf (name, sizeof (name), "t%d", p);
+            int pidx = -1;
+            EXRCORE_TEST_RVAL (
+                exr_add_part (f, name, EXR_STORAGE_SCANLINE, &pidx));
+            define_scan_part (f, p, width, height, lines_per_chunk);
+        }
+        EXRCORE_TEST_RVAL (exr_write_header (f));
+
+        /* every (part, chunk) job is handed to a worker thread */
+        std::vector<std::thread> workers;
+        for (int p = nparts - 1; p >= 0; --p)
+            for (int c = nchunks - 1; c >= 0; --c)
+                workers.emplace_back ([f, p, c] () {
+                    deliver_scan_chunk (f, p, width, c, lines_per_chunk);
+                });
+        for (auto& t: workers) t.join ();
+
+        for (int p = 0; p < nparts; ++p)
+        {
+            int32_t written = -1;
+            EXRCORE_TEST_RVAL (
+                exr_get_written_chunk_count (f, p, &written));
+            EXRCORE_TEST (written == nchunks);
+        }
+        EXRCORE_TEST_RVAL (exr_finish (&f));
+
+        exr_context_t             rf;
+        exr_context_initializer_t rinit = EXR_DEFAULT_CONTEXT_INITIALIZER;
+        rinit.error_handler_fn          = &err_cb;
+        EXRCORE_TEST_RVAL (exr_start_read (&rf, fn.c_str (), &rinit));
+        for (int p = 0; p < nparts; ++p)
+        {
+            EXRCORE_TEST_RVAL (exr_validate_chunk_table (rf, p));
+            for (int c = 0; c < nchunks; ++c)
+                check_scan_chunk (rf, p, width, c, lines_per_chunk);
+        }
+        EXRCORE_TEST_RVAL (exr_finish (&rf));
+        remove (fn.c_str ());
+    }
+
+    /* ---- 6. temporary-file mode: success renames into place, a
+     *        missing chunk leaves the partial material behind ---- */
+    {
+        std::string fn = tempdir + "deterministic_tmp.exr";
+
+        /* complete write: final name must appear, temp name gone */
+        {
+            exr_context_t             f;
+            exr_context_initializer_t cinit = EXR_DEFAULT_CONTEXT_INITIALIZER;
+            cinit.error_handler_fn          = &err_cb;
+            cinit.flags |= EXR_CONTEXT_FLAG_DETERMINISTIC_WRITE;
+
+            EXRCORE_TEST_RVAL (exr_start_write (
+                &f,
+                fn.c_str (),
+                EXR_INTERMEDIATE_TEMP_FILE,
+                &cinit));
+            int pidx = -1;
+            EXRCORE_TEST_RVAL (
+                exr_add_part (f, "only", EXR_STORAGE_SCANLINE, &pidx));
+            define_scan_part (f, 0, width, height, lines_per_chunk);
+            EXRCORE_TEST_RVAL (exr_write_header (f));
+            for (int c = 0; c < nchunks; ++c)
+                deliver_scan_chunk (f, 0, width, c, lines_per_chunk);
+            EXRCORE_TEST_RVAL (exr_finish (&f));
+#ifndef _WIN32
+            EXRCORE_TEST (access (fn.c_str (), F_OK) != -1);
+#endif
+            exr_context_t             rf;
+            exr_context_initializer_t rinit = EXR_DEFAULT_CONTEXT_INITIALIZER;
+            rinit.error_handler_fn          = &err_cb;
+            EXRCORE_TEST_RVAL (exr_start_read (&rf, fn.c_str (), &rinit));
+            EXRCORE_TEST_RVAL (exr_validate_chunk_table (rf, 0));
+            EXRCORE_TEST_RVAL (exr_finish (&rf));
+            remove (fn.c_str ());
+        }
+
+        /* incomplete write: finish reports the partial status and the
+         * (temporary) material is retained for inspection rather than
+         * deleted, while the final name is never produced */
+        {
+            exr_context_t             f;
+            exr_context_initializer_t cinit = EXR_DEFAULT_CONTEXT_INITIALIZER;
+            cinit.error_handler_fn          = &err_cb;
+            cinit.flags |= EXR_CONTEXT_FLAG_DETERMINISTIC_WRITE;
+
+            EXRCORE_TEST_RVAL (exr_start_write (
+                &f,
+                fn.c_str (),
+                EXR_INTERMEDIATE_TEMP_FILE,
+                &cinit));
+            const char* actualname = NULL;
+            EXRCORE_TEST_RVAL (exr_get_file_name (f, &actualname));
+            int pidx = -1;
+            EXRCORE_TEST_RVAL (
+                exr_add_part (f, "only", EXR_STORAGE_SCANLINE, &pidx));
+            define_scan_part (f, 0, width, height, lines_per_chunk);
+            EXRCORE_TEST_RVAL (exr_write_header (f));
+            for (int c = 0; c < nchunks - 1; ++c)
+                deliver_scan_chunk (f, 0, width, c, lines_per_chunk);
+            EXRCORE_TEST_RVAL_FAIL (
+                EXR_ERR_INCOMPLETE_CHUNK_TABLE, exr_finish (&f));
+#ifndef _WIN32
+            /* final destination must not have been renamed into place */
+            EXRCORE_TEST (access (fn.c_str (), F_OK) == -1);
+            /* but the partial material still exists on disk somewhere */
+            glob_t globbed;
+            std::string pattern = tempdir + "tmp.*deterministic_tmp.exr";
+            int       grv       = glob (pattern.c_str (), 0, NULL, &globbed);
+            EXRCORE_TEST (grv == 0);
+            EXRCORE_TEST (globbed.gl_pathc >= 1);
+            for (size_t i = 0; i < globbed.gl_pathc; ++i)
+                remove (globbed.gl_pathv[i]);
+            globfree (&globbed);
+#else
+            (void) actualname;
+#endif
+        }
+    }
+
+    /* ---- 7. normal mode keeps the original strict delivery rules ---- */
+    {
+        std::string               fn = tempdir + "normal_strict.exr";
+        exr_context_t             f;
+        exr_context_initializer_t cinit = EXR_DEFAULT_CONTEXT_INITIALIZER;
+        cinit.error_handler_fn          = &err_cb;
+
+        EXRCORE_TEST_RVAL (
+            exr_start_write (&f, fn.c_str (), EXR_WRITE_FILE_DIRECTLY, &cinit));
+        int isdet = 1;
+        EXRCORE_TEST_RVAL (exr_is_deterministic_write (f, &isdet));
+        EXRCORE_TEST (isdet == 0);
+
+        int pidx = -1;
+        EXRCORE_TEST_RVAL (
+            exr_add_part (f, "a", EXR_STORAGE_SCANLINE, &pidx));
+        define_scan_part (f, 0, width, height, lines_per_chunk);
+        EXRCORE_TEST_RVAL (
+            exr_add_part (f, "b", EXR_STORAGE_SCANLINE, &pidx));
+        define_scan_part (f, 1, width, height, lines_per_chunk);
+        EXRCORE_TEST_RVAL (exr_write_header (f));
+
+        /* writing part 1 before part 0 is finished must still fail,
+         * and skipping ahead within a part must still fail: the order
+         * enforcement lives in the actual chunk write. */
+        deliver_scan_chunk (f, 0, width, 0, lines_per_chunk);
+
+        /* encode a chunk for part 1, but the write must be rejected */
+        {
+            exr_chunk_info_t     cinfo;
+            exr_encode_pipeline_t encoder = EXR_ENCODE_PIPELINE_INITIALIZER;
+            std::unique_ptr<float[]> pixels (new float[width]);
+            for (int i = 0; i < width; ++i) pixels[i] = 1.0f;
+
+            EXRCORE_TEST_RVAL (
+                exr_write_scanline_chunk_info (f, 1, 0, &cinfo));
+            EXRCORE_TEST_RVAL (
+                exr_encoding_initialize (f, 1, &cinfo, &encoder));
+            encoder.channels[0].encode_from_ptr =
+                (const uint8_t*) pixels.get ();
+            encoder.channels[0].user_pixel_stride = (int) sizeof (float);
+            encoder.channels[0].user_line_stride =
+                width * (int) sizeof (float);
+            EXRCORE_TEST_RVAL (
+                exr_encoding_choose_default_routines (f, 1, &encoder));
+            EXRCORE_TEST_RVAL_FAIL (
+                EXR_ERR_INCORRECT_PART,
+                exr_encoding_run (f, 1, &encoder));
+            EXRCORE_TEST_RVAL (exr_encoding_destroy (f, &encoder));
+        }
+
+        /* skipping chunk 1 of part 0 must be rejected as well */
+        {
+            exr_chunk_info_t     cinfo;
+            exr_encode_pipeline_t encoder = EXR_ENCODE_PIPELINE_INITIALIZER;
+            std::unique_ptr<float[]> pixels (new float[width]);
+            for (int i = 0; i < width; ++i) pixels[i] = 2.0f;
+
+            EXRCORE_TEST_RVAL (exr_write_scanline_chunk_info (
+                f, 0, 2 * lines_per_chunk, &cinfo));
+            EXRCORE_TEST_RVAL (
+                exr_encoding_initialize (f, 0, &cinfo, &encoder));
+            encoder.channels[0].encode_from_ptr =
+                (const uint8_t*) pixels.get ();
+            encoder.channels[0].user_pixel_stride = (int) sizeof (float);
+            encoder.channels[0].user_line_stride =
+                width * (int) sizeof (float);
+            EXRCORE_TEST_RVAL (
+                exr_encoding_choose_default_routines (f, 0, &encoder));
+            EXRCORE_TEST_RVAL_FAIL (
+                EXR_ERR_INCORRECT_CHUNK,
+                exr_encoding_run (f, 0, &encoder));
+            EXRCORE_TEST_RVAL (exr_encoding_destroy (f, &encoder));
+        }
+
+        exr_finish (&f);
+        remove (fn.c_str ());
+    }
 }

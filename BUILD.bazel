@@ -232,6 +232,8 @@ cc_library(
         "src/lib/OpenEXRCore/internal_preview.h",
         "src/lib/OpenEXRCore/internal_pxr24.c",
         "src/lib/OpenEXRCore/internal_rle.c",
+        "src/lib/OpenEXRCore/internal_spool.c",
+        "src/lib/OpenEXRCore/internal_spool.h",
         "src/lib/OpenEXRCore/internal_string.h",
         "src/lib/OpenEXRCore/internal_string_vector.h",
         "src/lib/OpenEXRCore/internal_structs.c",

@@ -210,6 +210,7 @@ main (int argc, char* argv[])
     TEST (testWriteScans, "core_write");
     TEST (testWriteTiles, "core_write");
     TEST (testWriteMultiPart, "core_write");
+    TEST (testWriteDeterministic, "core_write");
     TEST (testWriteDeep, "core_write");
 
     TEST (testHUF, "core_compression");

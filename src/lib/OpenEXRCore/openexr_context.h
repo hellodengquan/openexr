@@ -360,6 +360,38 @@ typedef struct _exr_context_initializer_v4
 /** @brief Writes an old-style, sorted header with minimal information */
 #define EXR_CONTEXT_FLAG_WRITE_LEGACY_HEADER (1 << 3)
 
+/** @brief Produce a reproducible on-disk layout when writing.
+ *
+ * By default, image chunks are written to the output in the order the
+ * producers deliver them, and multi-part files must be filled part by
+ * part. When this flag is set on a write context, every completed
+ * chunk is instead spooled in memory and only written when the context
+ * is finished, in a fixed, predictable order that depends solely on
+ * the part definitions and per-part storage conventions:
+ *
+ * - parts appear in ascending part index order, and
+ * - within each part the chunks appear in ascending chunk index order
+ *   (scanline chunks top to bottom; tiles in the level / y / x order
+ *   defined by the OpenEXR file layout, which is the same order used by
+ *   the chunk offset table).
+ *
+ * This allows chunks to be produced in any order, concurrently and
+ * across parts, while the physical order of the parts and valid chunks
+ * in the output file, and the channels reachable through each chunk
+ * index, remain reproducible for a given set of layers.
+ *
+ * The trade-off is that all produced chunks are held in memory until
+ * finish. If a chunk is never produced, exr_finish() still writes the
+ * file (or renames the temporary file into place when using
+ * #EXR_INTERMEDIATE_TEMP_FILE), but returns
+ * #EXR_ERR_INCOMPLETE_CHUNK_TABLE and leaves the missing chunks'
+ * offset table entries zero: the resulting file is the same kind of
+ * partial material an interrupted normal write would leave behind, and
+ * can be inspected with the chunk reconstruction logic. Without the
+ * flag, the original delivery-order write behavior is unchanged.
+ */
+#define EXR_CONTEXT_FLAG_DETERMINISTIC_WRITE (1 << 4)
+
 /* clang-format off */
 /** @brief Simple macro to initialize the context initializer with default values. */
 #define EXR_DEFAULT_CONTEXT_INITIALIZER                                        \

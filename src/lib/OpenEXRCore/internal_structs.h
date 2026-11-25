@@ -8,6 +8,7 @@
 
 #include "openexr_config.h"
 #include "internal_attr.h"
+#include "internal_spool.h"
 
 #if ILMTHREAD_THREADING_ENABLED
 #    ifdef _WIN32
@@ -249,8 +250,22 @@ struct _priv_exr_context_t
 #endif
     uint8_t disable_chunk_reconstruct;
     uint8_t legacy_header;
-    uint8_t _pad[2];
+
+    /* Deterministic write mode (EXR_CONTEXT_FLAG_DETERMINISTIC_WRITE):
+     * chunks are spooled in memory and emitted in canonical order at
+     * finish, instead of being written in producer delivery order. */
+    uint8_t deterministic_write;
+    /* Set while the spool is being flushed: chunk write routines skip
+     * the delivery-order / current-part checks. */
+    uint8_t spool_flushing;
+    /* Deterministic flush finished with missing chunks: the partial
+     * output must be kept (no rename over the final name, no unlink). */
+    uint8_t keep_partial_output;
     uint32_t orig_version_and_flags;
+
+    /* In-memory spool used by deterministic write mode (empty
+     * otherwise). */
+    exr_spool_t spool;
 };
 
 #define EXR_CONST_CAST(t, v) ((t) (uintptr_t) v)

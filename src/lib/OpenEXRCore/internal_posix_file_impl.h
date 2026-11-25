@@ -81,6 +81,11 @@ finalize_write (exr_context_t pf, int failed)
 {
     exr_result_t rv = EXR_ERR_SUCCESS;
 
+    /* A deterministic write that ran out of chunks keeps its partial
+     * material on purpose: neither delete the output nor rename a
+     * temporary file over the final destination. */
+    if (pf->keep_partial_output) return EXR_ERR_SUCCESS;
+
     /* TODO: Do we actually want to do this or leave the garbage file there */
     if (failed && pf->destroy_fn == &default_shutdown)
     {
