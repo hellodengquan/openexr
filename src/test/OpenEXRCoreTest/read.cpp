@@ -580,10 +580,6 @@ testReadTiles (const std::string& tempdir)
 }
 
 void
-testReadMultiPart (const std::string& tempdir)
-{}
-
-void
 testReadUnpack (const std::string& tempdir)
 {
     exr_context_t             f;

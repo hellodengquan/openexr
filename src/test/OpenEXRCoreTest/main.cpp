@@ -190,6 +190,9 @@ main (int argc, char* argv[])
     TEST (testReadScans, "core_read");
     TEST (testReadTiles, "core_read");
     TEST (testReadMultiPart, "core_read");
+    TEST (testReadIncompleteReconstruction, "core_read");
+    TEST (testReadMixedStorageReconstruction, "core_read");
+    TEST (testReadCrossPartIndependence, "core_read");
     TEST (testReadDeep, "core_read");
     TEST (testDeepZstdNegativeSampleCounts, "core_read");
     TEST (testDeepZstdValidSampleCounts, "core_read");

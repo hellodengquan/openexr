@@ -341,167 +341,219 @@ extract_chunk_leader (
     return rv;
 }
 
+/*
+ * Read the chunk leader at an arbitrary file offset during a sequential
+ * reconstruction scan and attribute the chunk to the part it actually
+ * belongs to.
+ *
+ * Unlike read_and_validate_chunk_leader(), this does not assume the chunk
+ * belongs to a known part or occupies a particular slot in the scan order.
+ * For multi-part files the leader's own part number identifies the owning
+ * part, so parts that share the same coordinates (e.g. a plate and its
+ * matte stored as separate parts) stay independent of each other. The
+ * chunk index is then derived from the leader's own scanline / tile
+ * coordinates against the owning part's data window, tile layout and
+ * compression (lines per chunk).
+ */
 static exr_result_t
-extract_chunk_size (
+scan_and_attribute_chunk (
     exr_const_context_t   ctxt,
-    exr_const_priv_part_t part,
-    int                   partnum,
     uint64_t              offset,
-    uint64_t*             next_offset)
-{
-    struct priv_chunk_leader leader;
-
-    return extract_chunk_leader (
-        ctxt, part, partnum, offset, next_offset, &leader);
-}
-
-/**************************************/
-
-static exr_result_t
-read_and_validate_chunk_leader (
-    exr_const_context_t   ctxt,
-    exr_const_priv_part_t part,
-    int                   partnum,
-    uint64_t              offset,
-    int*                  indexio,
+    exr_const_priv_part_t* part_out,
+    int*                  index_out,
     uint64_t*             next_offset)
 {
     exr_result_t             rv = EXR_ERR_SUCCESS;
     struct priv_chunk_leader leader;
+    exr_const_priv_part_t    spart;
+    int                      partnum = 0;
 
-    rv = extract_chunk_leader (
-        ctxt, part, partnum, offset, next_offset, &leader);
-    if (rv != EXR_ERR_SUCCESS) return rv;
-
-    if (part->storage_mode == EXR_STORAGE_SCANLINE ||
-        part->storage_mode == EXR_STORAGE_DEEP_SCANLINE)
+    if (ctxt->is_multipart)
     {
-        int64_t chunk = (int64_t) leader.scanline_y;
-        chunk -= (int64_t) part->data_window.min.y;
-        chunk /= part->lines_per_chunk;
+        int32_t pnum = 0;
+        uint64_t poff = offset;
 
-        // scanlines can be more strict about the ordering
-        if (*indexio != (int)chunk || chunk < 0 || chunk >= part->chunk_count)
-            rv = ctxt->print_error (
+        rv = ctxt->do_read (
+            ctxt, &pnum, sizeof (int32_t), &poff, NULL, EXR_MUST_READ_ALL);
+        if (rv != EXR_ERR_SUCCESS) return rv;
+        pnum = (int32_t) one_to_native32 ((uint32_t) pnum);
+
+        if (pnum < 0 || pnum >= ctxt->num_parts)
+            return ctxt->print_error (
                 ctxt,
                 EXR_ERR_BAD_CHUNK_LEADER,
-                "Invalid chunk index: %" PRId64
-                " reading scanline %d (datawindow min %d) with lines per chunk %d",
+                "Invalid part number reconstructing chunk table: found %d, valid range 0 - %d",
+                pnum,
+                ctxt->num_parts - 1);
+        partnum = pnum;
+    }
+
+    spart = ctxt->parts[partnum];
+
+    rv = extract_chunk_leader (
+        ctxt, spart, partnum, offset, next_offset, &leader);
+    if (rv != EXR_ERR_SUCCESS) return rv;
+
+    if (spart->storage_mode == EXR_STORAGE_SCANLINE ||
+        spart->storage_mode == EXR_STORAGE_DEEP_SCANLINE)
+    {
+        int64_t chunk = (int64_t) leader.scanline_y;
+        chunk -= (int64_t) spart->data_window.min.y;
+        if (spart->lines_per_chunk <= 0)
+            return ctxt->print_error (
+                ctxt,
+                EXR_ERR_BAD_CHUNK_LEADER,
+                "Invalid lines per chunk (%d) reconstructing chunk table",
+                (int) spart->lines_per_chunk);
+        chunk /= spart->lines_per_chunk;
+
+        if (chunk < 0 || chunk >= spart->chunk_count)
+            return ctxt->print_error (
+                ctxt,
+                EXR_ERR_BAD_CHUNK_LEADER,
+                "Invalid chunk index %" PRId64
+                " reconstructing chunk table (scanline %d, part chunk count %d)",
                 chunk,
                 leader.scanline_y,
-                part->data_window.min.y,
-                part->lines_per_chunk);
-
-        *indexio = (int) chunk;
+                spart->chunk_count);
+        *index_out = (int) chunk;
     }
     else
     {
-        // because of random order, just go with it if the coordinates look sane
         int32_t cidx = 0;
-
-        rv = validate_and_compute_tile_chunk_off (
+        rv           = validate_and_compute_tile_chunk_off (
             ctxt,
-            part,
+            spart,
             leader.tile_x,
             leader.tile_y,
             leader.level_x,
             leader.level_y,
             &cidx);
-
-        *indexio = cidx;
+        if (rv != EXR_ERR_SUCCESS) return rv;
+        *index_out = (int) cidx;
     }
 
-    return rv;
+    *part_out = spart;
+    return EXR_ERR_SUCCESS;
 }
 
-// this should behave the same as the old ImfMultiPartInputFile
+/*
+ * Rebuild a part's chunk offset table from the raw chunk data.
+ *
+ * A single sequential scan covers every part's chunks: each chunk is
+ * attributed via its own leader (part number, then scanline / tile
+ * coordinates against the owning part's layout), making the result
+ * independent of the other parts and robust to out-of-order chunks.
+ */
 static exr_result_t
 reconstruct_chunk_table (
     exr_const_context_t ctxt, exr_const_priv_part_t part, uint64_t* chunktable)
 {
     exr_result_t          rv          = EXR_ERR_SUCCESS;
     exr_result_t          firstfailrv = EXR_ERR_SUCCESS;
-    uint64_t              offset_start, chunk_start, max_offset;
+    uint64_t              scan_start, scan_end;
+    uint64_t              cur_offset, next_offset;
     uint64_t*             curctable;
-    exr_const_priv_part_t curpart = NULL;
-    int                   found_ci, computed_ci, partnum = 0;
+    exr_const_priv_part_t lastpart;
+    int                   total_chunks = 0;
     size_t                chunkbytes;
 
-    curpart      = ctxt->parts[ctxt->num_parts - 1];
-    offset_start = curpart->chunk_table_offset;
-    offset_start += sizeof (uint64_t) * (uint64_t) curpart->chunk_count;
+    /*
+     * The chunk offset tables of every part are written contiguously right
+     * after the headers and before any chunk data. Thus the start of the
+     * chunk data region is immediately after the last part's offset table,
+     * and a single sequential scan from there reaches the chunks of every
+     * part in the order they were streamed to disk.
+     */
+    lastpart   = ctxt->parts[ctxt->num_parts - 1];
+    scan_start = lastpart->chunk_table_offset +
+                 sizeof (uint64_t) * (uint64_t) lastpart->chunk_count;
 
-    curpart = ctxt->parts[partnum];
-    while (curpart != part)
-    {
-        ++partnum;
-        curpart = ctxt->parts[partnum];
-    }
+    scan_end = (uint64_t) -1;
+    if (ctxt->file_size > 0) scan_end = (uint64_t) ctxt->file_size;
 
-    max_offset = (uint64_t) -1;
-    if (ctxt->file_size > 0) max_offset = (uint64_t) ctxt->file_size;
-
-    // for multi-part, need to start at the first part and extract everything, then
-    // work our way back up to this one, then grab the end of the previous part
-    if (partnum > 0)
-    {
-        curpart = ctxt->parts[partnum - 1];
-        rv      = extract_chunk_table (ctxt, curpart, &curctable, &chunk_start);
-        if (rv != EXR_ERR_SUCCESS) return rv;
-
-        chunk_start = offset_start;
-        for (int ci = 0; ci < curpart->chunk_count; ++ci)
-        {
-            if (curctable[ci] > chunk_start && curctable[ci] < max_offset)
-                chunk_start = curctable[ci];
-        }
-
-        rv = extract_chunk_size (
-            ctxt, curpart, partnum - 1, chunk_start, &offset_start);
-        if (rv != EXR_ERR_SUCCESS) return rv;
-    }
+    for (int p = 0; p < ctxt->num_parts; ++p)
+        total_chunks += ctxt->parts[p]->chunk_count;
 
     chunkbytes = (size_t) part->chunk_count * sizeof (uint64_t);
     curctable  = (uint64_t*) ctxt->alloc_fn (chunkbytes);
     if (!curctable) return EXR_ERR_OUT_OF_MEMORY;
-
     memset (curctable, 0, chunkbytes);
 
-    for (int ci = 0; ci < part->chunk_count; ++ci)
-    {
-        if (chunktable[ci] >= offset_start && chunktable[ci] < max_offset)
-        {
-            offset_start = chunktable[ci];
-        }
-        chunk_start = offset_start;
-        computed_ci = ci;
-        if (part->lineorder == EXR_LINEORDER_DECREASING_Y)
-            computed_ci = part->chunk_count - (ci + 1);
-        found_ci = computed_ci;
+    cur_offset = scan_start;
 
-        rv = read_and_validate_chunk_leader (
-            ctxt, part, partnum, chunk_start, &found_ci, &offset_start);
+    /*
+     * Walk every chunk on disk once. Each chunk is attributed purely from
+     * its own leader, so a corrupt / missing entry in one part can never
+     * drag another part's chunks into the wrong slots, and parts covering
+     * the same coordinates remain independent. Bounding the number of
+     * iterations guarantees a malformed leader can never loop forever.
+     */
+    for (int seen = 0;
+         seen < total_chunks && cur_offset < scan_end;
+         ++seen)
+    {
+        exr_const_priv_part_t owner = NULL;
+        int                   cidx  = -1;
+
+        next_offset = cur_offset;
+        rv          = scan_and_attribute_chunk (
+            ctxt, cur_offset, &owner, &cidx, &next_offset);
         if (rv != EXR_ERR_SUCCESS)
         {
-            chunk_start = 0;
             if (firstfailrv == EXR_ERR_SUCCESS) firstfailrv = rv;
+            break;
         }
 
-        if (found_ci >= 0 && found_ci < part->chunk_count)
+        if (next_offset <= cur_offset)
         {
-            if (curctable[found_ci] == 0) curctable[found_ci] = chunk_start;
+            /* a zero-size / non-advancing chunk would hang the scan */
+            if (firstfailrv == EXR_ERR_SUCCESS)
+                firstfailrv = ctxt->print_error (
+                    ctxt,
+                    EXR_ERR_BAD_CHUNK_LEADER,
+                    "Invalid chunk size reconstructing chunk table: chunk does not advance past file offset %" PRIu64,
+                    cur_offset);
+            break;
+        }
+
+        if (owner == part && cidx >= 0 && cidx < part->chunk_count)
+        {
+            /* first occurrence wins: keep the first valid offset seen */
+            if (curctable[cidx] == 0) curctable[cidx] = cur_offset;
+        }
+
+        cur_offset = next_offset;
+    }
+
+    if (firstfailrv == EXR_ERR_SUCCESS)
+    {
+        for (int ci = 0; ci < part->chunk_count; ++ci)
+        {
+            if (curctable[ci] == 0)
+            {
+                /*
+                 * The scan reached the end of the file without locating
+                 * this chunk: it was never written. Keep it distinct from
+                 * a valid chunk that decodes to all-black pixels, whose
+                 * offset is non-zero.
+                 */
+                firstfailrv = EXR_ERR_INCOMPLETE_CHUNK_TABLE;
+                break;
+            }
         }
     }
+
     if (firstfailrv == EXR_ERR_SUCCESS)
     {
         memcpy (chunktable, curctable, chunkbytes);
     }
     else
     {
+        /* merge whatever was recovered; unfound entries stay zero */
         for (int ci = 0; ci < part->chunk_count; ++ci)
         {
-            if ( curctable[ci] != 0 )
-                chunktable[ci] = curctable[ci];
+            if (curctable[ci] != 0) chunktable[ci] = curctable[ci];
         }
     }
     ctxt->free_fn (curctable);

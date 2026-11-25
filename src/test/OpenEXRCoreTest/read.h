@@ -19,6 +19,9 @@ void testOpenDeep (const std::string& tempdir);
 void testReadScans (const std::string& tempdir);
 void testReadTiles (const std::string& tempdir);
 void testReadMultiPart (const std::string& tempdir);
+void testReadIncompleteReconstruction (const std::string& tempdir);
+void testReadMixedStorageReconstruction (const std::string& tempdir);
+void testReadCrossPartIndependence (const std::string& tempdir);
 
 void testReadUnpack (const std::string& tempdir);
 

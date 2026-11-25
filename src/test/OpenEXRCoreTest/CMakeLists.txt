@@ -20,6 +20,7 @@ add_executable(OpenEXRCoreTest
   main.cpp
   read.cpp
   read.h
+  reconstruct.cpp
   test_value.h
   write.cpp
   write.h
@@ -104,6 +105,9 @@ define_openexrcore_tests(
  testReadScans
  testReadTiles
  testReadMultiPart
+ testReadIncompleteReconstruction
+ testReadMixedStorageReconstruction
+ testReadCrossPartIndependence
  testReadDeep
  testDeepZstdNegativeSampleCounts
  testDeepZstdValidSampleCounts
