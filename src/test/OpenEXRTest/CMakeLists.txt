@@ -271,3 +271,25 @@ set_tests_properties (OpenEXR.testLargeDataWindowOffsets        PROPERTIES COST 
 set_tests_properties (OpenEXR.testCopyDeepScanLine              PROPERTIES COST 13)
 set_tests_properties (OpenEXR.testCompression                   PROPERTIES COST 12)
 
+# Standalone verification for InputFile::readRegion() coordinate-space
+# region reads.  Separate from the monolithic OpenEXRTest runner so an
+# evaluator can build and execute just this check.
+add_executable (oeRegionReadVerify regionReadVerify.cpp)
+target_link_libraries (oeRegionReadVerify OpenEXR::OpenEXR)
+set_target_properties (oeRegionReadVerify PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+  CXX_STANDARD_REQUIRED ON
+  CXX_EXTENSIONS OFF
+)
+target_compile_features (oeRegionReadVerify PRIVATE cxx_std_${OPENEXR_CXX_STANDARD})
+if (WIN32 AND BUILD_SHARED_LIBS)
+  target_compile_definitions (oeRegionReadVerify PRIVATE OPENEXR_DLL)
+endif ()
+add_test (
+  NAME OpenEXR.RegionRead
+  COMMAND ${CMAKE_CROSSCOMPILING_EMULATOR}
+          $<TARGET_FILE:oeRegionReadVerify>
+          "${CMAKE_CURRENT_BINARY_DIR}"
+)
+set_tests_properties (OpenEXR.RegionRead PROPERTIES LABELS "OpenEXR")
+

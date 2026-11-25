@@ -18,8 +18,11 @@
 #include "ImfForward.h"
 
 #include "ImfThreading.h"
+#include "ImfPixelType.h"
 
 #include "ImfContext.h"
+
+#include <Imath/ImathBox.h>
 
 OPENEXR_IMF_INTERNAL_NAMESPACE_HEADER_ENTER
 
@@ -222,6 +225,81 @@ public:
     IMF_EXPORT
     void readPixels (
         const FrameBuffer& frameBuffer, int scanLine1, int scanLine2);
+
+    //---------------------------------------------------------------
+    // Read a region specified in original/image coordinates.
+    //
+    // `region` is a rectangle expressed in the same coordinate
+    // system as the header's data/display window.  Its intersection
+    // with the file's data window is decoded and copied into the
+    // slices of `frameBuffer`.  Each slice is normally built with
+    // Slice::MakeRegion(), so its memory describes a target rectangle
+    // anchored at region.min with caller owned pixel and row strides
+    // (rows may contain extra padding).
+    //
+    // Only channel sample sites inside the intersection are written.
+    // The original sampling grid is preserved for subsampled
+    // channels even when region.min is negative or odd, and target
+    // pixels outside the intersection (margins, row padding,
+    // previously painted background) are never modified.
+    //
+    // The return value is the intersected rectangle in original
+    // coordinates; subtract region.min from its corners to obtain
+    // the touched offsets inside the target rectangle.  An empty box
+    // is returned (and nothing is written) when the region does not
+    // intersect the data window.
+    //
+    // Primarily intended for scanline-based files; for tiled files
+    // it reuses InputFile's existing tiled-to-scanline translation
+    // (non-subsampled tiled channels are clipped the same way).
+    //---------------------------------------------------------------
+
+    IMF_EXPORT
+    IMATH_NAMESPACE::Box2i readRegion (
+        const IMATH_NAMESPACE::Box2i& region,
+        const FrameBuffer&            frameBuffer);
+
+    //---------------------------------------------------------------
+    // Single-channel convenience wrapper around readRegion().
+    //
+    // `data` addresses the destination pixel for region.min.
+    // `xStride` is the byte distance between neighboring logical
+    // pixels (0 -> tightly packed values of `type`); `yStride` is
+    // the caller owned byte distance between destination rows
+    // (0 -> tight rows of region width).  The channel's sampling
+    // factors are taken from the file header automatically.
+    //---------------------------------------------------------------
+
+    IMF_EXPORT
+    IMATH_NAMESPACE::Box2i readRegionChannel (
+        const char*                   channelName,
+        const IMATH_NAMESPACE::Box2i& region,
+        void*                         data,
+        PixelType                     type,
+        size_t                        xStride   = 0,
+        size_t                        yStride   = 0,
+        double                        fillValue = 0.0);
+
+    // Spellings that emphasize "selection in original coordinates".
+    IMATH_NAMESPACE::Box2i readSelection (
+        const IMATH_NAMESPACE::Box2i& region,
+        const FrameBuffer&            frameBuffer)
+    {
+        return readRegion (region, frameBuffer);
+    }
+
+    IMATH_NAMESPACE::Box2i readSelection (
+        const char*                   channelName,
+        const IMATH_NAMESPACE::Box2i& region,
+        void*                         data,
+        PixelType                     type,
+        size_t                        xStride   = 0,
+        size_t                        yStride   = 0,
+        double                        fillValue = 0.0)
+    {
+        return readRegionChannel (
+            channelName, region, data, type, xStride, yStride, fillValue);
+    }
 
     //----------------------------------------------
     // Read a block of raw pixel data from the file,

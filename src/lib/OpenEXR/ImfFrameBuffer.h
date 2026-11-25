@@ -148,6 +148,43 @@ struct IMF_EXPORT_TYPE Slice
         double                        fillValue   = 0.0,
         bool                          xTileCoords = false,
         bool                          yTileCoords = false);
+
+    //------------------------------------------------------------
+    // Region destination builder.
+    //
+    // Builds a slice for a rectangular DESTINATION REGION expressed
+    // in the file's original (data/display window) coordinates.
+    // `ptr` addresses the destination pixel corresponding to
+    // `region.min`; neighboring logical pixels are xStride bytes
+    // apart and neighboring destination rows are yStride bytes
+    // apart.  yStride is completely caller owned, so rows may carry
+    // extra padding; pass 0 for a tight region.
+    //
+    // Unlike Make(), the strides passed in here are LOGICAL pixel
+    // strides, not strides between subsampled samples.  The returned
+    // slice scales them by the sampling factors and offsets its base
+    // by the RAW region origin.  This keeps every channel sample on
+    // its original sampling grid even when region.min is negative or
+    // odd: for a 2-sampled channel and region.min.x == -3 the first
+    // sample (global x == -2) lands one logical pixel inside the
+    // destination, exactly as the original coordinates require.
+    //
+    // The resulting slice is meant to be handed to
+    // InputFile::readRegion() / copyRegionPixels(); reads are clipped
+    // to the region intersection, so bytes outside it are never
+    // written and pre-existing background/padding/sentinels survive.
+    //------------------------------------------------------------
+
+    IMF_EXPORT
+    static Slice MakeRegion (
+        PixelType                     type,
+        void*                         ptr,
+        const IMATH_NAMESPACE::Box2i& region,
+        size_t                        xStride   = 0,
+        size_t                        yStride   = 0,
+        int                           xSampling = 1,
+        int                           ySampling = 1,
+        double                        fillValue = 0.0);
 };
 
 class IMF_EXPORT_TYPE FrameBuffer
@@ -227,6 +264,50 @@ public:
 private:
     SliceMap _map;
 };
+
+//------------------------------------------------------------
+// Sampling-grid helpers.
+//
+// OpenEXR sample sites for sampling factor s are the integer
+// multiples of s: ..., -2s, -s, 0, s, 2s, ...  Indexing that grid
+// requires mathematical floor/ceil division; C++ truncation towards
+// zero gives a different grid cell for negative non-multiples (for
+// example -1 / 2 truncates to 0 while floor (-1/2) is -1).
+// `sampling` must be positive.
+//------------------------------------------------------------
+
+IMF_EXPORT
+int64_t floorSampleIndex (int64_t coordinate, int sampling);
+
+IMF_EXPORT
+int64_t ceilSampleIndex (int64_t coordinate, int sampling);
+
+//------------------------------------------------------------
+// Copy the samples of every same-named slice present in both
+// frame buffers that fall inside
+//
+//     region intersect sourceBounds
+//
+// (both boxes are expressed in original/image coordinates).
+//
+// Addressing goes through each slice's sampling grid, so negative
+// coordinates and negative odd region origins preserve the original
+// channel sample positions.  Only actual sample sites inside the
+// intersection are touched; everything else in the destination
+// slices (margins, row padding, previously painted background,
+// sentinels) is left unchanged.
+//
+// Source and destination slices must have the same pixel type and
+// sampling factors.  Returns the intersected box, or an empty box
+// when there is no intersection.
+//------------------------------------------------------------
+
+IMF_EXPORT
+IMATH_NAMESPACE::Box2i copyRegionPixels (
+    const FrameBuffer&                   source,
+    const FrameBuffer&                   destination,
+    const IMATH_NAMESPACE::Box2i&        region,
+    const IMATH_NAMESPACE::Box2i&        sourceBounds);
 
 //----------
 // Iterators

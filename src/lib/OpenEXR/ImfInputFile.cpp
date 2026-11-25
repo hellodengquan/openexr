@@ -14,6 +14,7 @@
 #include "ImfCheckedArithmetic.h"
 
 #include "ImfChannelList.h"
+#include "ImfFrameBuffer.h"
 #include "ImfInputPartData.h"
 #include "ImfInputStreamMutex.h"
 #include "ImfMisc.h"
@@ -34,6 +35,7 @@
 #include <algorithm>
 #include <fstream>
 #include <iostream>
+#include <numeric>
 #include <vector>
 
 OPENEXR_IMF_INTERNAL_NAMESPACE_SOURCE_ENTER
@@ -233,6 +235,254 @@ InputFile::readPixels (
     const FrameBuffer& frameBuffer, int scanLine1, int scanLine2)
 {
     _data->readPixels (frameBuffer, scanLine1, scanLine2);
+}
+
+IMATH_NAMESPACE::Box2i
+InputFile::readRegion (
+    const IMATH_NAMESPACE::Box2i& region, const FrameBuffer& outFrameBuffer)
+{
+    const Header&          hdr = header ();
+    const IMATH_NAMESPACE::Box2i& dw = hdr.dataWindow ();
+
+    const int64_t clipMinX =
+        std::max (static_cast<int64_t> (region.min.x),
+                  static_cast<int64_t> (dw.min.x));
+    const int64_t clipMinY =
+        std::max (static_cast<int64_t> (region.min.y),
+                  static_cast<int64_t> (dw.min.y));
+    const int64_t clipMaxX =
+        std::min (static_cast<int64_t> (region.max.x),
+                  static_cast<int64_t> (dw.max.x));
+    const int64_t clipMaxY =
+        std::min (static_cast<int64_t> (region.max.y),
+                  static_cast<int64_t> (dw.max.y));
+
+    // No overlap: strictly avoid touching any destination byte.
+    if (clipMinX > clipMaxX || clipMinY > clipMaxY)
+        return IMATH_NAMESPACE::Box2i ();
+
+    if (outFrameBuffer.begin () == outFrameBuffer.end ())
+    {
+        return IMATH_NAMESPACE::Box2i (
+            IMATH_NAMESPACE::V2i (
+                static_cast<int> (clipMinX), static_cast<int> (clipMinY)),
+            IMATH_NAMESPACE::V2i (
+                static_cast<int> (clipMaxX), static_cast<int> (clipMaxY)));
+    }
+
+    //
+    // Scanline decoders always produce complete rows, so decode the
+    // full data-window width of the intersected Y band into packed
+    // scratch slices and then blit only the requested intersection
+    // into the caller's region slices.  The second step is what
+    // guarantees that margins and caller owned row padding are never
+    // overwritten.
+    //
+
+    FrameBuffer scratch;
+
+    // Keeps the packed scratch planes alive until the blit is done.
+    std::vector<std::unique_ptr<char[]> > storage;
+
+    //
+    // Restrict the decoded scan-line range to the intersected band.
+    // The first requested line is rounded down to a coordinate that
+    // lies on every slice's vertical sampling grid (LCM of the
+    // sampling factors); this keeps the decoder's pointer arithmetic
+    // identical to global-coordinate indexing even for negative
+    // coordinates.  On any overflow/odd setup we safely fall back to
+    // the data-window minimum, which is grid aligned for valid files.
+    //
+
+    int commonSamplingY = 1;
+    for (FrameBuffer::ConstIterator it = outFrameBuffer.begin ();
+         it != outFrameBuffer.end ();
+         ++it)
+    {
+        int     sy = it.slice ().ySampling > 0 ? it.slice ().ySampling : 1;
+        int64_t g  = std::gcd (static_cast<int64_t> (commonSamplingY),
+                              static_cast<int64_t> (sy));
+        int64_t l =
+            (static_cast<int64_t> (commonSamplingY) / g) *
+            static_cast<int64_t> (sy);
+        if (l <= 0 || l > (1 << 20))
+        {
+            commonSamplingY = 0; // fallback to data-window minimum
+            break;
+        }
+        commonSamplingY = static_cast<int> (l);
+    }
+
+    int bandStartY = dw.min.y;
+    if (commonSamplingY > 0)
+    {
+        int64_t aligned =
+            floorSampleIndex (clipMinY, commonSamplingY) * commonSamplingY;
+        if (aligned >= static_cast<int64_t> (dw.min.y) &&
+            aligned <= clipMaxY &&
+            aligned >= static_cast<int64_t> (INT32_MIN))
+        {
+            bandStartY = static_cast<int> (aligned);
+        }
+    }
+
+    for (FrameBuffer::ConstIterator it = outFrameBuffer.begin ();
+         it != outFrameBuffer.end ();
+         ++it)
+    {
+        Slice dst = it.slice ();
+
+        int sx = dst.xSampling > 0 ? dst.xSampling : 1;
+        int sy = dst.ySampling > 0 ? dst.ySampling : 1;
+
+        // The decoder validates slice sampling against the file
+        // channel; report mismatches with a region-specific message.
+        const Channel* fileChannel = hdr.channels ().findChannel (it.name ());
+        if (fileChannel &&
+            (fileChannel->xSampling != sx || fileChannel->ySampling != sy))
+        {
+            THROW (
+                IEX_NAMESPACE::ArgExc,
+                "Sampling factors of slice \""
+                    << it.name ()
+                    << "\" do not match the file channel while reading "
+                       "region \""
+                    << fileName () << "\".");
+        }
+
+        size_t elementBytes;
+        switch (dst.type)
+        {
+            case HALF: elementBytes = sizeof (uint16_t); break;
+            case FLOAT:
+            case UINT: elementBytes = sizeof (uint32_t); break;
+            default:
+                THROW (
+                    IEX_NAMESPACE::ArgExc,
+                    "Unsupported pixel type in region slice \""
+                        << it.name () << "\".");
+        }
+
+        // Sample-grid index range: full data-window width (scanline
+        // codecs always decode complete rows) and only the aligned
+        // intersected Y band.  The scratch plane is packed by index.
+        const int64_t kx0 = floorSampleIndex (dw.min.x, sx);
+        const int64_t kx1 = floorSampleIndex (dw.max.x, sx);
+        const int64_t ky0 = floorSampleIndex (bandStartY, sy);
+        const int64_t ky1 = floorSampleIndex (clipMaxY, sy);
+
+        const int64_t samplesX = kx1 - kx0 + 1;
+        const int64_t samplesY = ky1 - ky0 + 1;
+
+        if (samplesX <= 0 || samplesY <= 0)
+        {
+            THROW (
+                IEX_NAMESPACE::ArgExc,
+                "Invalid sample grid for region slice \"" << it.name ()
+                                                          << "\".");
+        }
+
+        const int64_t scratchXStride = static_cast<int64_t> (elementBytes);
+        if (samplesX > INT64_MAX / scratchXStride)
+        {
+            THROW (
+                IEX_NAMESPACE::ArgExc,
+                "Scratch buffer overflow while reading region slice \""
+                    << it.name () << "\".");
+        }
+        const int64_t scratchYStride = samplesX * scratchXStride;
+        if (samplesY > INT64_MAX / scratchYStride)
+        {
+            THROW (
+                IEX_NAMESPACE::ArgExc,
+                "Scratch buffer overflow while reading region slice \""
+                    << it.name () << "\".");
+        }
+        const int64_t scratchBytes = samplesY * scratchYStride;
+
+        if (scratchBytes <= 0 ||
+            scratchBytes > static_cast<int64_t> (PTRDIFF_MAX))
+        {
+            THROW (
+                IEX_NAMESPACE::ArgExc,
+                "Scratch buffer overflow while reading region slice \""
+                    << it.name () << "\".");
+        }
+
+        std::unique_ptr<char[]> mem (
+            new char[static_cast<size_t> (scratchBytes)]);
+
+        // Standard global-coordinate slice base: grid index (0,0) is
+        // the virtual origin, actual allocation starts at (kx0,ky0).
+        const intptr_t raw = reinterpret_cast<intptr_t> (mem.get ());
+        char* base = reinterpret_cast<char*> (
+            raw - kx0 * scratchXStride - ky0 * scratchYStride);
+
+        scratch.insert (
+            it.name (),
+            Slice (
+                dst.type,
+                base,
+                static_cast<size_t> (scratchXStride),
+                static_cast<size_t> (scratchYStride),
+                sx,
+                sy,
+                dst.fillValue));
+
+        storage.push_back (std::move (mem));
+    }
+
+    // One-shot overload: does not require or mutate the persistent
+    // frame buffer previously set on this InputFile.
+    readPixels (scratch, bandStartY, static_cast<int> (clipMaxY));
+
+    return copyRegionPixels (scratch, outFrameBuffer, region, dw);
+}
+
+IMATH_NAMESPACE::Box2i
+InputFile::readRegionChannel (
+    const char*                   channelName,
+    const IMATH_NAMESPACE::Box2i& region,
+    void*                         data,
+    PixelType                     type,
+    size_t                        xStride,
+    size_t                        yStride,
+    double                        fillValue)
+{
+    if (!channelName || channelName[0] == 0)
+    {
+        THROW (IEX_NAMESPACE::ArgExc, "Region channel name cannot be empty.");
+    }
+    if (!data)
+    {
+        THROW (
+            IEX_NAMESPACE::ArgExc,
+            "Destination buffer for region channel \""
+                << channelName << "\" cannot be null.");
+    }
+
+    int sx = 1;
+    int sy = 1;
+    if (const Channel* c = header ().channels ().findChannel (channelName))
+    {
+        sx = c->xSampling;
+        sy = c->ySampling;
+    }
+
+    FrameBuffer fb;
+    fb.insert (
+        channelName,
+        Slice::MakeRegion (
+            type,
+            data,
+            region,
+            xStride,
+            yStride,
+            sx,
+            sy,
+            fillValue));
+
+    return readRegion (region, fb);
 }
 
 void
