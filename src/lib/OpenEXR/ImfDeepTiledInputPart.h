@@ -15,6 +15,8 @@
 
 OPENEXR_IMF_INTERNAL_NAMESPACE_HEADER_ENTER
 
+struct DeepTileSampleCounts;
+
 class IMF_EXPORT_TYPE DeepTiledInputPart
 {
 public:
@@ -333,6 +335,30 @@ public:
 
     IMF_EXPORT
     void readPixelSampleCounts (int dx1, int dx2, int dy1, int dy2, int l = 0);
+
+    //------------------------------------------------------------------
+    // Read the per-pixel deep sample counts for an arbitrary pixel
+    // region of a (possibly reduced-resolution) level.
+    //
+    // The region is given in absolute pixel coordinates of the
+    // requested level; lx and ly select the horizontal and vertical
+    // detail independently (MIPMAP_LEVELS and RIPMAP_LEVELS).
+    //
+    // The returned DeepTileSampleCounts holds the actual pixel box
+    // covered (the region clipped to the level, including partial edge
+    // tiles) and one sample count per pixel of that box. A region that
+    // does not intersect the level returns an empty dataWindow and no
+    // samples. An invalid level (lx, ly) throws an ArgExc.
+    //------------------------------------------------------------------
+
+    IMF_EXPORT
+    DeepTileSampleCounts readPixelSampleCountsForRegion (
+        const IMATH_NAMESPACE::Box2i& region, int lx, int ly) const;
+
+    IMF_EXPORT
+    DeepTileSampleCounts
+    readPixelSampleCountsForRegion (const IMATH_NAMESPACE::Box2i& region, int l = 0)
+        const;
 
 private:
     DeepTiledInputFile* file;

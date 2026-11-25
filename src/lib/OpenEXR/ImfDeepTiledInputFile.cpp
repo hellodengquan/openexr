@@ -22,6 +22,8 @@
 #include "ImfDeepFrameBuffer.h"
 #include "ImfInputPartData.h"
 
+#include "ImfCheckedArithmetic.h"
+
 // TODO: remove once TiledOutput is converted
 #include "ImfTileOffsets.h"
 #include "ImfTiledMisc.h"
@@ -719,6 +721,239 @@ DeepTiledInputFile::readPixelSampleCounts (
     int dx1, int dx2, int dy1, int dy2, int l)
 {
     readPixelSampleCounts (dx1, dx2, dy1, dy2, l, l);
+}
+
+DeepTileSampleCounts
+DeepTiledInputFile::readPixelSampleCountsForRegion (
+    const IMATH_NAMESPACE::Box2i& region, int lx, int ly) const
+{
+    //
+    // Read the per-pixel deep sample counts for an arbitrary pixel
+    // region of level (lx, ly). The level selection in x and y is
+    // independent, so this also covers RIPMAP_LEVELS files.
+    //
+
+    DeepTileSampleCounts result;
+
+    try
+    {
+        if (!isValidLevel (lx, ly))
+            THROW (
+                IEX_NAMESPACE::ArgExc,
+                "Level coordinate "
+                    << "(" << lx << ", " << ly << ") is invalid.");
+
+        const IMATH_NAMESPACE::Box2i levelWindow = dataWindowForLevel (lx, ly);
+
+        //
+        // Clip the requested region to the level's pixel range. A
+        // region that does not intersect this level cannot produce any
+        // tiles and yields an explicit empty result.
+        //
+
+        IMATH_NAMESPACE::Box2i clipped = region;
+        clipped.min.x = std::max (clipped.min.x, levelWindow.min.x);
+        clipped.min.y = std::max (clipped.min.y, levelWindow.min.y);
+        clipped.max.x = std::min (clipped.max.x, levelWindow.max.x);
+        clipped.max.y = std::min (clipped.max.y, levelWindow.max.y);
+
+        if (clipped.min.x > clipped.max.x ||
+            clipped.min.y > clipped.max.y)
+        {
+            return result;
+        }
+
+        int32_t tileSizeX = 0, tileSizeY = 0;
+        if (EXR_ERR_SUCCESS !=
+            exr_get_tile_sizes (
+                _ctxt,
+                _data->partNumber,
+                lx,
+                ly,
+                &tileSizeX,
+                &tileSizeY))
+        {
+            throw IEX_NAMESPACE::ArgExc (
+                "Unable to query the tile sizes for the requested level.");
+        }
+
+        //
+        // Convert the clipped pixel box to the tile range that covers
+        // it. Coordinates are local to the level's data window so that
+        // files whose data window does not start at (0, 0) are handled.
+        //
+
+        const int firstTileX =
+            (clipped.min.x - levelWindow.min.x) / tileSizeX;
+        const int lastTileX =
+            (clipped.max.x - levelWindow.min.x) / tileSizeX;
+        const int firstTileY =
+            (clipped.min.y - levelWindow.min.y) / tileSizeY;
+        const int lastTileY =
+            (clipped.max.y - levelWindow.min.y) / tileSizeY;
+
+        const int boxWidth  = clipped.max.x - clipped.min.x + 1;
+        const int boxHeight = clipped.max.y - clipped.min.y + 1;
+        const size_t pixelCount =
+            static_cast<size_t> (boxWidth) * static_cast<size_t> (boxHeight);
+
+        // Throws OverflowExc if the allocation cannot be sized safely.
+        checkArraySize (pixelCount, sizeof (unsigned int));
+
+        result.dataWindow = clipped;
+        result.sampleCounts.assign (pixelCount, 0u);
+
+        //
+        // Only the sample count tables are needed: the deep pixel data
+        // itself is not decoded. The pipeline is reused across tiles to
+        // avoid re-allocating its scratch buffers per tile.
+        //
+
+        struct RegionDecode
+        {
+            ~RegionDecode ()
+            {
+                if (initialized)
+                    exr_decoding_destroy (ctxt, &pipeline);
+            }
+
+            bool                 initialized = false;
+            exr_const_context_t  ctxt = nullptr;
+            exr_decode_pipeline_t pipeline =
+                EXR_DECODE_PIPELINE_INITIALIZER;
+        } decode;
+        decode.ctxt = _ctxt;
+
+        for (int ty = firstTileY; ty <= lastTileY; ++ty)
+        {
+            for (int tx = firstTileX; tx <= lastTileX; ++tx)
+            {
+                exr_chunk_info_t cinfo;
+                exr_result_t rv = exr_read_tile_chunk_info (
+                    _ctxt, _data->partNumber, tx, ty, lx, ly, &cinfo);
+                if (EXR_ERR_INCOMPLETE_CHUNK_TABLE == rv)
+                {
+                    THROW (
+                        IEX_NAMESPACE::InputExc,
+                        "Tile (" << tx << ", " << ty << ", " << lx << ", "
+                                 << ly << ") is missing.");
+                }
+                else if (EXR_ERR_SUCCESS != rv)
+                {
+                    throw IEX_NAMESPACE::InputExc (
+                        "Unable to query tile information");
+                }
+
+                if (!decode.initialized)
+                {
+                    if (EXR_ERR_SUCCESS !=
+                        exr_decoding_initialize (
+                            _ctxt, _data->partNumber, &cinfo, &decode.pipeline))
+                    {
+                        throw IEX_NAMESPACE::IoExc (
+                            "Unable to initialize decode pipeline");
+                    }
+                    decode.initialized = true;
+
+                    //
+                    // Native-order individual counts (n, m, o, ...) and skip
+                    // the deep pixel data entirely. The flags are constant
+                    // for every tile of this request, so the default
+                    // routines only need to be chosen once.
+                    //
+
+                    decode.pipeline.decode_flags |=
+                        EXR_DECODE_SAMPLE_COUNTS_AS_INDIVIDUAL;
+                    decode.pipeline.decode_flags |=
+                        EXR_DECODE_SAMPLE_DATA_ONLY;
+
+                    if (EXR_ERR_SUCCESS !=
+                        exr_decoding_choose_default_routines (
+                            _ctxt, _data->partNumber, &decode.pipeline))
+                    {
+                        throw IEX_NAMESPACE::IoExc (
+                            "Unable to choose decoder routines");
+                    }
+                }
+                else if (
+                    EXR_ERR_SUCCESS !=
+                    exr_decoding_update (
+                        _ctxt, _data->partNumber, &cinfo, &decode.pipeline))
+                {
+                    throw IEX_NAMESPACE::IoExc (
+                        "Unable to update decode pipeline");
+                }
+
+                rv = exr_decoding_run (
+                    _ctxt, _data->partNumber, &decode.pipeline);
+                if (EXR_ERR_SUCCESS != rv)
+                {
+                    THROW (
+                        IEX_NAMESPACE::IoExc,
+                        "Unable to run decoder: "
+                            << exr_get_error_code_as_string (rv));
+                }
+
+                //
+                // Absolute pixel origin of this tile. Edge tiles are
+                // smaller than the nominal tile size, so the copy is
+                // bounded both by the tile and by the requested box.
+                //
+
+                const int tileAbsX =
+                    levelWindow.min.x + tileSizeX * cinfo.start_x;
+                const int tileAbsY =
+                    levelWindow.min.y + tileSizeY * cinfo.start_y;
+
+                const int copyX0 = std::max (tileAbsX, clipped.min.x);
+                const int copyY0 = std::max (tileAbsY, clipped.min.y);
+                const int copyX1 = std::min (
+                    tileAbsX + static_cast<int> (cinfo.width) - 1,
+                    clipped.max.x);
+                const int copyY1 = std::min (
+                    tileAbsY + static_cast<int> (cinfo.height) - 1,
+                    clipped.max.y);
+
+                const int32_t* counts = decode.pipeline.sample_count_table;
+
+                for (int y = copyY0; y <= copyY1; ++y)
+                {
+                    const int tileRow = y - tileAbsY;
+                    const int boxRow  = y - clipped.min.y;
+                    for (int x = copyX0; x <= copyX1; ++x)
+                    {
+                        const int tileCol = x - tileAbsX;
+                        const int boxCol  = x - clipped.min.x;
+                        result.sampleCounts
+                            [static_cast<size_t> (boxRow) * boxWidth +
+                             boxCol] =
+                                static_cast<unsigned int> (
+                                    counts[static_cast<size_t> (tileRow) *
+                                               cinfo.width +
+                                           tileCol]);
+                    }
+                }
+            }
+        }
+    }
+    catch (IEX_NAMESPACE::BaseExc& e)
+    {
+        REPLACE_EXC (
+            e,
+            "Error reading deep tiled sample counts from image "
+            "file \""
+                << fileName () << "\". " << e.what ());
+        throw;
+    }
+
+    return result;
+}
+
+DeepTileSampleCounts
+DeepTiledInputFile::readPixelSampleCountsForRegion (
+    const IMATH_NAMESPACE::Box2i& region, int l) const
+{
+    return readPixelSampleCountsForRegion (region, l, l);
 }
 
 size_t

@@ -14,6 +14,7 @@
 #include <string.h>
 
 #include "ImfDeepTiledInputFile.h"
+#include "ImfDeepTiledInputPart.h"
 #include "ImfDeepTiledOutputFile.h"
 
 #include <IlmThreadPool.h>
@@ -22,6 +23,7 @@
 #include <ImfCompression.h>
 #include <ImfDeepFrameBuffer.h>
 #include <ImfHeader.h>
+#include <ImfMultiPartInputFile.h>
 #include <ImfPartType.h>
 #include <ImfTileDescription.h>
 
@@ -1104,6 +1106,346 @@ readWriteTestWithAbsoluateCoordinates (
     }
 }
 
+//
+// Check DeepTiledInputFile::readPixelSampleCountsForRegion():
+// region requests on a deep tiled file must return the actual pixel
+// box of the intersecting tiles (clipped to the reduced level) and the
+// per-pixel deep sample counts within that box, with coordinates in the
+// frame of the requested level. Horizontal and vertical detail levels
+// are selected independently, and regions that miss the level must
+// come back as an explicit empty result.
+//
+void
+readPixelSampleCountsForRegionTest (const std::string& tempDir)
+{
+    cout << "Testing readPixelSampleCountsForRegion on deep tiles" << endl;
+
+    const int tw = 16;
+    const int th = 16;
+    const int w  = 65;   // not a multiple of the tile size on purpose
+    const int h  = 33;
+    const int minX = 7;
+    const int minY = -3;
+    const Box2i dataWindow (
+        V2i (minX, minY), V2i (minX + w - 1, minY + h - 1));
+    const Box2i displayWindow (V2i (0, 0), V2i (w - 1, h - 1));
+
+    const Compression compressions[] = {
+        NO_COMPRESSION, RLE_COMPRESSION, ZIPS_COMPRESSION, ZSTD_COMPRESSION};
+    const LevelMode modes[] = {
+        RIPMAP_LEVELS, MIPMAP_LEVELS, ONE_LEVEL};
+
+    for (const LevelMode mode : modes)
+    {
+        for (const Compression compression : compressions)
+        {
+            if (!isValidDeepCompression (compression)) continue;
+
+            std::string filename =
+                tempDir + "imf_test_deep_tiled_region_" +
+                std::to_string (static_cast<int> (mode)) + ".exr";
+            remove (filename.c_str ());
+
+            //
+            // Deterministic per-pixel sample counts, independent of any
+            // level: count(x, y) depends only on the level-0 pixel.
+            //
+            auto expectedCount = [w, minX, minY] (int x, int y) -> unsigned int {
+                int dx = x - minX;
+                int dy = y - minY;
+                return static_cast<unsigned int> ((dx * 7 + dy * 13 + 1) % 11);
+            };
+
+            {
+                Header hdr (
+                    displayWindow,
+                    dataWindow,
+                    1,
+                    V2f (0, 0),
+                    1,
+                    INCREASING_Y,
+                    compression);
+                hdr.channels ().insert ("Z", Channel (IMF::FLOAT));
+                hdr.setType (DEEPTILE);
+                hdr.setTileDescription (
+                    TileDescription (tw, th, mode));
+
+                DeepTiledOutputFile out (filename.c_str (), hdr, 1);
+
+                Array2D<unsigned int> sc (h, w);
+                Array2D<void*>        pdata (h, w);
+
+                DeepFrameBuffer fb;
+                fb.insertSampleCountSlice (Slice (
+                    IMF::UINT,
+                    reinterpret_cast<char*> (
+                        &sc[0][0] - (minX + minY * w)),
+                    sizeof (unsigned int),
+                    sizeof (unsigned int) * w));
+                fb.insert (
+                    "Z",
+                    DeepSlice (
+                        IMF::FLOAT,
+                        reinterpret_cast<char*> (
+                            &pdata[0][0] - (minX + minY * w)),
+                        sizeof (void*),
+                        sizeof (void*) * w,
+                        sizeof (float)));
+                out.setFrameBuffer (fb);
+
+                for (int ly = 0; ly < out.numYLevels (); ++ly)
+                {
+                    for (int lx = 0; lx < out.numXLevels (); ++lx)
+                    {
+                        if (mode != RIPMAP_LEVELS && lx != ly) continue;
+
+                        Box2i levelWindow = out.dataWindowForLevel (lx, ly);
+
+                        for (int ty = 0; ty < out.numYTiles (ly); ++ty)
+                        {
+                            for (int tx = 0; tx < out.numXTiles (lx); ++tx)
+                            {
+                                Box2i box =
+                                    out.dataWindowForTile (tx, ty, lx, ly);
+                                for (int y = box.min.y; y <= box.max.y; ++y)
+                                {
+                                    for (int x = box.min.x; x <= box.max.x; ++x)
+                                    {
+                                        int dwy = y - levelWindow.min.y;
+                                        int dwx = x - levelWindow.min.x;
+                                        unsigned int n = expectedCount (x, y);
+                                        sc[dwy][dwx]    = n;
+                                        pdata[dwy][dwx] =
+                                            static_cast<void*> (new float[n]);
+                                        for (unsigned int s = 0; s < n; ++s)
+                                            ((float*) pdata[dwy][dwx])[s] =
+                                                static_cast<float> (s);
+                                    }
+                                }
+                                out.writeTile (tx, ty, lx, ly);
+
+                                for (int y = box.min.y; y <= box.max.y; ++y)
+                                    for (int x = box.min.x; x <= box.max.x; ++x)
+                                    {
+                                        int dwy = y - levelWindow.min.y;
+                                        int dwx = x - levelWindow.min.x;
+                                        delete[] static_cast<float*> (
+                                            pdata[dwy][dwx]);
+                                        pdata[dwy][dwx] = nullptr;
+                                    }
+                            }
+                        }
+                    }
+                }
+            }
+
+            DeepTiledInputFile in (filename.c_str (), 1);
+            assert (in.levelMode () == mode);
+
+            //
+            // Independently chosen horizontal and vertical detail levels,
+            // including levels whose width or height is a single pixel.
+            //
+            for (int ly = 0; ly < in.numYLevels (); ++ly)
+            {
+                for (int lx = 0; lx < in.numXLevels (); ++lx)
+                {
+                    if (!in.isValidLevel (lx, ly))
+                    {
+                        // MIPMAP / ONE_LEVEL files only have lx == ly.
+                        bool threw = false;
+                        try
+                        {
+                            in.readPixelSampleCountsForRegion (dataWindow, lx, ly);
+                        }
+                        catch (const IEX_NAMESPACE::ArgExc&)
+                        {
+                            threw = true;
+                        }
+                        assert (threw);
+                        continue;
+                    }
+
+                    Box2i levelWindow = in.dataWindowForLevel (lx, ly);
+                    int    levelW = levelWindow.max.x - levelWindow.min.x + 1;
+                    int    levelH = levelWindow.max.y - levelWindow.min.y + 1;
+
+                    //
+                    // (1) Whole level: the returned box must be the level
+                    // data window itself and every count must match.
+                    //
+                    DeepTileSampleCounts whole =
+                        in.readPixelSampleCountsForRegion (levelWindow, lx, ly);
+                    assert (whole.dataWindow == levelWindow);
+                    assert (
+                        whole.sampleCounts.size () ==
+                        static_cast<size_t> (levelW) * levelH);
+
+                    for (int y = levelWindow.min.y; y <= levelWindow.max.y; ++y)
+                        for (int x = levelWindow.min.x;
+                             x <= levelWindow.max.x;
+                             ++x)
+                        {
+                            int row = y - whole.dataWindow.min.y;
+                            int col = x - whole.dataWindow.min.x;
+                            unsigned int got =
+                                whole.sampleCounts[row * levelW + col];
+                            assert (got == expectedCount (x, y));
+                        }
+
+                    //
+                    // (2) Arbitrary sub-region crossing tile boundaries and
+                    // clipped at the reduced image's right/bottom edges.
+                    //
+                    Box2i requested (
+                        V2i (
+                            levelWindow.min.x + 3,
+                            levelWindow.min.y + 1),
+                        V2i (
+                            levelWindow.max.x + 100,
+                            levelWindow.max.y + 100));
+                    DeepTileSampleCounts part =
+                        in.readPixelSampleCountsForRegion (requested, lx, ly);
+
+                    Box2i expectedBox (
+                        V2i (
+                            std::max (requested.min.x, levelWindow.min.x),
+                            std::max (requested.min.y, levelWindow.min.y)),
+                        V2i (levelWindow.max.x, levelWindow.max.y));
+
+                    if (expectedBox.min.x > expectedBox.max.x ||
+                        expectedBox.min.y > expectedBox.max.y)
+                    {
+                        // The level is smaller than the requested origin:
+                        // this is a non-intersecting request on this level.
+                        assert (part.dataWindow.isEmpty ());
+                        assert (part.sampleCounts.empty ());
+                    }
+                    else
+                    {
+                        assert (part.dataWindow == expectedBox);
+                        int partW =
+                            expectedBox.max.x - expectedBox.min.x + 1;
+                        int partH =
+                            expectedBox.max.y - expectedBox.min.y + 1;
+                        assert (
+                            part.sampleCounts.size () ==
+                            static_cast<size_t> (partW) * partH);
+
+                        for (int y = expectedBox.min.y;
+                             y <= expectedBox.max.y;
+                             ++y)
+                            for (int x = expectedBox.min.x;
+                                 x <= expectedBox.max.x;
+                                 ++x)
+                            {
+                                int row = y - part.dataWindow.min.y;
+                                int col = x - part.dataWindow.min.x;
+                                assert (
+                                    part.sampleCounts[row * partW + col] ==
+                                    expectedCount (x, y));
+                            }
+                    }
+
+                    //
+                    // (3) Region lying inside a single tile.
+                    //
+                    Box2i single (
+                        V2i (levelWindow.min.x, levelWindow.min.y),
+                        V2i (levelWindow.min.x, levelWindow.min.y));
+                    DeepTileSampleCounts one =
+                        in.readPixelSampleCountsForRegion (single, lx, ly);
+                    assert (one.dataWindow == single);
+                    assert (one.sampleCounts.size () == 1);
+                    assert (
+                        one.sampleCounts[0] ==
+                        expectedCount (single.min.x, single.min.y));
+
+                    //
+                    // (4) Region that does not intersect the level: the
+                    // request cannot form any tile, so the result must be
+                    // explicitly empty rather than throw.
+                    //
+                    Box2i miss (
+                        V2i (
+                            levelWindow.max.x + 5,
+                            levelWindow.max.y + 5),
+                        V2i (
+                            levelWindow.max.x + 50,
+                            levelWindow.max.y + 50));
+                    DeepTileSampleCounts empty =
+                        in.readPixelSampleCountsForRegion (miss, lx, ly);
+                    assert (empty.dataWindow.isEmpty ());
+                    assert (empty.sampleCounts.empty ());
+
+                    //
+                    // (5) A default-constructed (empty) box is likewise a
+                    // non-intersecting request and must not throw.
+                    //
+                    DeepTileSampleCounts emptyBox =
+                        in.readPixelSampleCountsForRegion (Box2i (), lx, ly);
+                    assert (emptyBox.dataWindow.isEmpty ());
+                    assert (emptyBox.sampleCounts.empty ());
+                }
+            }
+
+            //
+            // (6) Invalid level coordinates must be reported, even for an
+            // otherwise empty request.
+            //
+            bool threw = false;
+            try
+            {
+                in.readPixelSampleCountsForRegion (
+                    dataWindow, in.numXLevels (), in.numYLevels ());
+            }
+            catch (const IEX_NAMESPACE::ArgExc&)
+            {
+                threw = true;
+            }
+            assert (threw);
+
+            //
+            // (7) Same behavior through the multi-part input wrapper.
+            //
+            {
+                MultiPartInputFile mp (filename.c_str ());
+                DeepTiledInputPart part (mp, 0);
+                Box2i levelWindow = part.dataWindowForLevel (0, 0);
+                DeepTileSampleCounts viaPart =
+                    part.readPixelSampleCountsForRegion (levelWindow, 0, 0);
+                assert (viaPart.dataWindow == levelWindow);
+                int levelW = levelWindow.max.x - levelWindow.min.x + 1;
+                int levelH = levelWindow.max.y - levelWindow.min.y + 1;
+                assert (
+                    viaPart.sampleCounts.size () ==
+                    static_cast<size_t> (levelW) * levelH);
+                for (int y = levelWindow.min.y; y <= levelWindow.max.y; ++y)
+                    for (int x = levelWindow.min.x;
+                         x <= levelWindow.max.x;
+                         ++x)
+                    {
+                        int row = y - levelWindow.min.y;
+                        int col = x - levelWindow.min.x;
+                        assert (
+                            viaPart.sampleCounts[row * levelW + col] ==
+                            expectedCount (x, y));
+                    }
+
+                // Single-level convenience overload.
+                DeepTileSampleCounts viaLevel =
+                    part.readPixelSampleCountsForRegion (levelWindow, 0);
+                assert (viaLevel.dataWindow == levelWindow);
+                assert (viaLevel.sampleCounts == viaPart.sampleCounts);
+            }
+
+            remove (filename.c_str ());
+        }
+    }
+
+    cout << "ok\n" << endl;
+}
+
 } // namespace
 
 void
@@ -1127,6 +1469,7 @@ testDeepTiledBasic (const std::string& tempDir)
 
         readWriteAllZeroSampleCountsDeepTiled (tempDir);
         deepTiledAreaOverflow (tempDir);
+        readPixelSampleCountsForRegionTest (tempDir);
         ThreadPool::globalThreadPool ().setNumThreads (numThreads);
 
         cout << "ok\n" << endl;

@@ -207,4 +207,18 @@ DeepTiledInputPart::readPixelSampleCounts (
     file->readPixelSampleCounts (dx1, dx2, dy1, dy2, l);
 }
 
+DeepTileSampleCounts
+DeepTiledInputPart::readPixelSampleCountsForRegion (
+    const IMATH_NAMESPACE::Box2i& region, int lx, int ly) const
+{
+    return file->readPixelSampleCountsForRegion (region, lx, ly);
+}
+
+DeepTileSampleCounts
+DeepTiledInputPart::readPixelSampleCountsForRegion (
+    const IMATH_NAMESPACE::Box2i& region, int l) const
+{
+    return file->readPixelSampleCountsForRegion (region, l);
+}
+
 OPENEXR_IMF_INTERNAL_NAMESPACE_SOURCE_EXIT

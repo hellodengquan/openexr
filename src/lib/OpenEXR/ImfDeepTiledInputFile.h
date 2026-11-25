@@ -24,7 +24,36 @@
 
 #include <Imath/ImathBox.h>
 
+#include <vector>
+
 OPENEXR_IMF_INTERNAL_NAMESPACE_HEADER_ENTER
+
+//
+// Result of a region request against a deep tiled level.
+//
+// dataWindow    : the actual pixel box covered by the returned sample
+//                 counts, clipped to the level's data window. All
+//                 coordinates are absolute pixel coordinates of the
+//                 requested (reduced-resolution) level, so they can be
+//                 used directly with dataWindowForLevel() /
+//                 dataWindowForTile(). The box is empty
+//                 (dataWindow.isEmpty() == true) when the requested
+//                 region does not intersect the level.
+//
+// sampleCounts  : one per-pixel deep sample count for every pixel in
+//                 dataWindow, stored row by row, top to bottom, with
+//                 width (dataWindow.max.x - dataWindow.min.x + 1)
+//                 entries per row and height
+//                 (dataWindow.max.y - dataWindow.min.y + 1) rows.
+//                 The entry for pixel (x, y) is at
+//                 sampleCounts[(y - dataWindow.min.y) * width +
+//                              (x - dataWindow.min.x)].
+//
+struct IMF_EXPORT_TYPE DeepTileSampleCounts
+{
+    IMATH_NAMESPACE::Box2i    dataWindow;
+    std::vector<unsigned int> sampleCounts;
+};
 
 class IMF_EXPORT_TYPE DeepTiledInputFile
 {
@@ -378,6 +407,49 @@ public:
 
     IMF_EXPORT
     void readPixelSampleCounts (int dx1, int dx2, int dy1, int dy2, int l = 0);
+
+    //------------------------------------------------------------------
+    // Read the per-pixel deep sample counts for an arbitrary pixel
+    // region of a (possibly reduced-resolution) level.
+    //
+    // Unlike the tile-based functions above, the region is given in
+    // absolute pixel coordinates of the requested level, not in tile
+    // coordinates. lx and ly select the horizontal and vertical detail
+    // independently, so this works for both MIPMAP_LEVELS and
+    // RIPMAP_LEVELS files; for ONE_LEVEL / MIPMAP_LEVELS files use the
+    // single-level convenience overload below.
+    //
+    // The function computes which tiles of level (lx, ly) intersect
+    // the requested region, reads only their sample count tables, and
+    // returns:
+    //
+    //   - the actual pixel box that was read, which is the requested
+    //     region intersected with and clipped to the level's data
+    //     window (including the partial tiles at a reduced image's
+    //     right and bottom edges);
+    //   - one deep sample count per pixel of that box, row by row.
+    //
+    // A compositor can therefore allocate its channel sample storage
+    // from the returned box dimensions and the per-pixel counts alone,
+    // without knowing the file's tile size.
+    //
+    // If the requested region does not intersect the level's data
+    // window, the request cannot produce any tiles: the returned
+    // DeepTileSampleCounts holds an empty dataWindow and no samples,
+    // instead of throwing.
+    //
+    // An invalid level (lx, ly), i.e. isValidLevel(lx, ly) == false,
+    // throws an IEX_NAMESPACE::ArgExc exception.
+    //------------------------------------------------------------------
+
+    IMF_EXPORT
+    DeepTileSampleCounts readPixelSampleCountsForRegion (
+        const IMATH_NAMESPACE::Box2i& region, int lx, int ly) const;
+
+    IMF_EXPORT
+    DeepTileSampleCounts
+    readPixelSampleCountsForRegion (const IMATH_NAMESPACE::Box2i& region, int l = 0)
+        const;
 
 private:
     Context _ctxt;
