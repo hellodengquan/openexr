@@ -27,6 +27,7 @@
 #include "general_attr.h"
 #include "initializer_compat.h"
 #include "read.h"
+#include "tile_offsets.h"
 #include "write.h"
 #include "buffer.h"
 
@@ -196,6 +197,9 @@ main (int argc, char* argv[])
     TEST (testDeepScanlineZeroSampleCountLeader, "core_read");
     TEST (testReadUnpack, "core_read");
     TEST (testSamplingCalcs, "core_read");
+    TEST (testReadTilesFarOffsets, "core_read");
+    TEST (testReadTilesTruncated, "core_read");
+    TEST (testReadTilesMissingChunk, "core_read");
 
     TEST (testWriteBadArgs, "core_write");
     TEST (testWriteBadFiles, "core_write");
